@@ -1,0 +1,616 @@
+stages:
+  - test-helm-validate
+  - test-helm-publish
+  - validate-helm-publish
+  - test-terraform-validate
+  - test-terraform-test
+  - test-terraform-publish
+  - validate-terraform-publish
+
+include:
+  - local: '/config/jobimage.yml'
+  - local: '/config/k8s.yml'
+  - local: '/config/nexus.yml'
+  - local: '/jobs/lib.yml'
+  - local: '/config/report.yml'
+  - local: '/tests/helm/test.yml'
+  - local: '/tests/terraform/test.yml'
+  - local: '/config/rdsutils.yml'
+
+
+####################
+#  General CI CD   #
+####################
+
+# Build id from git 
+.build_id: &build_id |-
+ export BUILD_ID=$(git rev-list --count master)
+
+.cp-build-id:
+  image: $CP_JOBIMAGE_DOCKER
+  before_script:
+    - *build_id
+  only:
+    - master 
+
+
+.report_command: &report_command |-
+ export PGPASSWORD=$CP_REPORT_DB_PASSWORD
+ if [ -z "$CP_REPORT_COMPONENT_KEY" ]; then if [ -e  ./sonar-key.txt ]; then export CP_REPORT_COMPONENT_KEY=$( cat ./sonar-key.txt | tr ":" "_" | tr "[:lower:]" "[:upper:]" ) ; else export CP_REPORT_COMPONENT_KEY=$(echo $SONARQUBE_PROJECT_KEY | tr ":" "_" | tr "[:lower:]" "[:upper:]") ; fi ; fi
+ cp-event-report.sh
+ export ARTIFACT_ID=$( psql -h $CP_REPORT_DB_HOST -p 5432 -d cpl -U $CP_REPORT_DB_USER -q -t -A -c "SELECT artifact_id from cpl.artifact WHERE commit='$CI_COMMIT_SHA' ")
+ if [ -e ./mochawesome-report/mochawesome.json ]; then  echo "unit,$(cat ./mochawesome-report/mochawesome.json | jq -r '.stats | [.tests , .passes , .failures ] | join(",")' ),$CI_COMMIT_SHA,$ARTIFACT_ID,$CI_PIPELINE_URL" > test.csv && psql -h $CP_REPORT_DB_HOST -p 5432 -d cpl -U $CP_REPORT_DB_USER -c "\copy cpl.test (test, total, passed, failed , commit, artifact_id, link) FROM 'test.csv' DELIMITER ',' CSV" || true ; fi
+ if [ -e ./scan-results.json ]; then  echo "twistlock,$(cat ./scan-results.json | jq -r '.results[].vulnerabilityDistribution | [.critical,.high,.medium,.low,.total] | join(",")' ),$CI_COMMIT_SHA,$ARTIFACT_ID,$CI_PIPELINE_URL" > scan.csv && psql -h $CP_REPORT_DB_HOST -p 5432 -d cpl -U $CP_REPORT_DB_USER -c "\copy cpl.scan (scan, critical, high, medium, low, total, commit, artifact_id, link) FROM 'scan.csv' DELIMITER ',' CSV" || true; fi
+ git tag | sed '/-/!{s/$/_/}' | sort -V -r  | sed 's/_$//' | head -n 2 | tail -n +2 || true
+ git tag | sed '/-/!{s/$/_/}' | sort -V -r  | sed 's/_$//' | head -n 1 | tail -n +1 || true
+ export LAST_RELEASE=$( git tag | sed '/-/!{s/$/_/}' | sort -V -r  | sed 's/_$//' | head -n 2 | tail -n +2 ) || true
+ export CURRENT_RELEASE=$( git tag | sed '/-/!{s/$/_/}' | sort -V -r  | sed 's/_$//' | head -n 1 | tail -n +1 ) || true
+ git diff ${LAST_RELEASE} ${CURRENT_RELEASE} --unified=0 --ignore-all-space  -- CHANGELOG.md  |   grep -Po '(?<=^\+)(?!\+\+).*' > CHANGELOGDELTA.md  || true
+ if [ -n "$CI_COMMIT_TAG" ]; then psql -h $CP_REPORT_DB_HOST -p 5432 -d cpl -U $CP_REPORT_DB_USER -c "INSERT INTO cpl.release (tag, artifact_id, changelog, changelogdelta) VALUES ('$CI_COMMIT_TAG',(SELECT artifact_id FROM cpl.artifact WHERE cpl.artifact.commit = '$CI_COMMIT_SHA' ),'$( base64 CHANGELOG.md | tr -d '\n ')','$( base64 CHANGELOGDELTA.md | tr -d '\n ')')" || true; fi
+ curl -X POST -H "Content-Type: application/json" -d '{"token":"'${CI_JOB_TOKEN}'", "ref":"'${CP_REPORT_GENERATION_PROJECT_REF}'", "variables": {"ACTION": "generatereport"}}' "${CI_API_V4_URL}/projects/${CP_REPORT_GENERATION_PROJECT}/trigger/pipeline" || true
+
+
+ 
+.cp-reporting:
+  image: $CP_JOBIMAGE_REPORT
+  script:
+    - *report_command
+
+########################
+# Application / Docker # 
+########################
+
+
+.cp-sonar-scan-npm:
+  image: $CP_JOBIMAGE_SONAR
+  stage: quality
+  allow_failure: true
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  before_script:
+    - git fetch --unshallow || true
+    - npm ci --legacy-peer-deps
+  script:
+    - npm run lint
+    - npm test
+    - if [ -e ./sonar-project.properties ]; then export SONAR_OPTS=""  ; else export SONAR_OPTS="-Dsonar.sources=${CI_PROJECT_DIR} -Dsonar.exclusions=$SONARQUBE_EXCLUSIONS -Dsonar.qualitygate.wait=true -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info" ; fi 
+    - echo "SONAR_OPTS=$SONAR_OPTS"
+    - echo $SONARQUBE_PROJECT_KEY > sonar-key.txt
+    - npx sonar-scanner
+      -Dsonar.host.url=${SONARQUBE_URL}
+      -Dsonar.login=${SONARQUBE_TOKEN}
+      -Dsonar.analysis.mode=publish
+      -Dsonar.gitlab.project_id=${CI_PROJECT_PATH}
+      -Dsonar.gitlab.commit_sha=${CI_COMMIT_SHA}
+      -Dsonar.gitlab.ref_name=${CI_COMMIT_REF_NAME}
+      -Dsonar.gitlab.json_mode=SAST
+      -Dsonar.gitlab.failure_notification_mode=exit-code
+      -Dsonar.gitlab.only_issue_from_commit_file=true
+      -Dsonar.gitlab.disable_inline_comments=false
+      -Dsonar.gitlab.unique_issue_per_inline=true
+      -Dsonar.projectKey=${SONARQUBE_PROJECT_KEY}
+      -Dsonar.verbose=false $SONAR_OPTS
+  artifacts:
+    when: always
+    paths:
+      - ./scan-results.json
+      - ./sonar-key.txt
+
+
+.cp-sonar-scan-scala:
+  image: $CP_JOBIMAGE_SONAR
+  stage: quality
+  allow_failure: true
+  before_script:
+    - git fetch --unshallow || true
+  script:
+    - if [ -e ./sonar-project.properties ]; then export SONAR_OPTS=""  ; else export SONAR_OPTS="-Dsonar.sources=${CI_PROJECT_DIR} -Dsonar.exclusions=$SONARQUBE_EXCLUSIONS -Dsonar.qualitygate.wait=true" ; fi 
+    - echo "SONAR_OPTS=$SONAR_OPTS"
+    - echo $SONARQUBE_PROJECT_KEY > sonar-key.txt
+    - sbt clean coverage test coverageReport scapegoat sonarScan
+      -Dsonar.host.url=${SONARQUBE_URL}
+      -Dsonar.login=${SONARQUBE_TOKEN}
+      -Dsonar.analysis.mode=publish
+      -Dsonar.gitlab.project_id=${CI_PROJECT_PATH}
+      -Dsonar.gitlab.commit_sha=${CI_COMMIT_SHA}
+      -Dsonar.gitlab.ref_name=${CI_COMMIT_REF_NAME}
+      -Dsonar.gitlab.json_mode=SAST
+      -Dsonar.gitlab.failure_notification_mode=exit-code
+      -Dsonar.gitlab.only_issue_from_commit_file=true
+      -Dsonar.gitlab.disable_inline_comments=false
+      -Dsonar.gitlab.unique_issue_per_inline=true
+      -Dsonar.projectKey=${SONARQUBE_PROJECT_KEY}
+      -Dsonar.verbose=true $SONAR_OPTS
+  artifacts:
+    when: always
+    paths:
+      - ./scan-results.json
+      - ./sonar-key.txt
+
+
+
+
+.cp-twistlock-scan:
+  image: $CP_JOBIMAGE_TWIST_LOCK
+  stage: twistlock_security_scan
+  only:
+    - branches
+    - master
+    - tags
+  services:
+    - docker:18.09.7-dind    
+  script:
+    - echo CI_JOB_IMAGE=$CI_JOB_IMAGE
+    - if [ -z "$IMAGE_TO_SCAN" ]; then IMAGE_TO_SCAN=$REPOSITORY_URL:$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG ; fi 
+    - echo IMAGE_TO_SCAN=$IMAGE_TO_SCAN
+    - docker pull $IMAGE_TO_SCAN
+    - echo Scanning Image To scan-results.json
+    - echo $IMAGE_TO_SCAN > docker.url
+    - echo using TL server $CP_TWISTLOCK_HOST
+    - twistcli images scan 
+      --address $CP_TWISTLOCK_HOST
+      --user $TWISTLOCK_ADMIN_USER 
+      --password $TWISTLOCK_ADMIN_PASSWORD 
+      --output-file scan-results.json 
+      --publish --details $IMAGE_TO_SCAN
+
+  after_script:
+    - *report_command 
+  allow_failure: false 
+  artifacts:
+    when: always
+    paths:
+      - ./scan-results.json
+      - ./docker.url
+    reports:
+      container_scanning:
+        - ./scan-results.json
+
+
+
+####################
+#       Nexus      #
+####################
+
+#.nexusgetrepourl: &nexusgetrrepourl |-
+# CP_NEXUS_GET_REPO_URL=$(curl -s  $CP_NEXUS_API_BASE_URL/v1/repositories | jq '.[] | select(.name=="'$CP_NEXUS_GET_REPO_NAME'")' | jq -r .url)
+
+.nexus_clone_get_src_repo: &nexus_clone_get_src_repo |-
+ echo "Downloading all stable artifacts from Nexus repo $CP_NEXUS_CLONE_SRC_REPO "
+ CONTINUATION_QUERY=""
+ while curl -s --fail "$CP_NEXUS_API_BASE_URL/v1/assets?repository=$CP_NEXUS_CLONE_SRC_REPO&$CONTINUATION_QUERY" > results.json  ;
+  do 
+  CONTINUATION_QUERY="continuationToken=$( cat results.json | jq -r .continuationToken )";
+  echo $CONTINUATION_QUERY
+  for url in $( cat results.json | jq -r .items[].downloadUrl | grep /$CP_NEXUS_CLONE_SRC_REPO/$CP_NEXUS_CLONE_SRC_REPO_DIR);
+   do 
+    curl -s $url --output ${url##*/} ;
+   done ;
+  done;
+
+.nexus_clone_reindex_helm: &nexus_clone_reindex_helm |-
+ if $CP_NEXUS_CLONE_IS_HELM ; then helm repo index . --url $CP_NEXUS_BASE_URL/repository/$CP_NEXUS_CLONE_DEST_REPO/$CP_NEXUS_CLONE_DEST_REPO_DIR ;  fi
+
+.nexus_clone_upload_dest_repo: &nexus_clone_upload_dest_repo |-
+ find . -type f -exec curl -u $CP_NEXUS_CLONE_USER --upload-file {} $CP_NEXUS_BASE_URL/repository/$CP_NEXUS_CLONE_DEST_REPO/$CP_NEXUS_CLONE_DEST_REPO_DIR/{} \;
+
+.cp-nexus-clone-repo:
+  script:
+   - mkdir temp; cd temp
+   - *nexus_clone_get_src_repo
+   - *nexus_clone_reindex_helm
+   - *nexus_clone_upload_dest_repo
+
+####################
+#       ECR        #
+####################
+.ecr_clone_get_repo_urls: &ecr_clone_get_repo_urls |-
+ aws ecr --region=us-east-1 describe-repositories
+ for url in $(aws ecr --region=us-east-1 describe-repositories | jq -r '.repositories[] | select(.repositoryName==('$CP_ECR_CLONE_REPO_CSV')) | .repositoryUri ' ) ; do 
+ echo $url ; 
+ done ;
+
+.cp-nexus-clone-ecr:
+  image: $CP_JOBIMAGE_K8S
+  script:
+   - mkdir temp; cd temp
+   - *ecr_clone_get_repo_urls
+
+
+
+.ecr_clone_repos_from_csv_list: &ecr_clone_repos_from_csv_list |-
+ for IMAGE in ${CP_ECR_CLONE_REPO_CSV//,/ } ; do 
+  REPO=$(python3 -c "repoAndTag='"$IMAGE"'; print(repoAndTag.split(':')[0])" ) ;
+  TAG=$(python3 -c "repoAndTag='"$IMAGE"'; print(repoAndTag.split(':')[1])" ) ;
+  NEW_REPO=$REPO/prod ;  
+  docker pull $CP_ECR_BASE_URL/$IMAGE ; 
+  docker tag $CP_ECR_BASE_URL/$IMAGE $CP_ECR_BASE_URL/$NEW_REPO:$TAG ;
+  docker push $CP_ECR_BASE_URL/$NEW_REPO:$TAG ;
+ done ;
+
+.ecr_clone_repos:
+ image: $CP_JOBIMAGE_DOCKER
+ services:
+   - docker:dind
+ variables:
+    DOCKER_TLS_CERTDIR: ''
+ script:
+   - mkdir temp; cd temp
+   - *ecr_clone_repos_from_csv_list
+
+####################
+#       Helm       #
+####################
+
+.setrepooptions: &setrepooptions |-
+ if [ -z "$CI_COMMIT_TAG" ]; then if [[ "$CI_COMMIT_REF_SLUG" == "master" || "$CI_COMMIT_REF_SLUG" == "develop" ]]; then export CP_HELM_REPO_NAME=ci/$CI_COMMIT_REF_SLUG/$CI_PROJECT_NAME ; else export CP_HELM_REPO_NAME=ci-temp/$CI_COMMIT_REF_SLUG/$CI_PROJECT_NAME ; fi   else export CP_HELM_REPO_NAME=stable ; export CP_HELM_COMMAND_OPT="--merge ./package/merge.yaml"  ; fi
+
+.settemprepo: &settemprepo |-
+ export CP_HELM_REPO_NAME=ci-temp/$CI_COMMIT_SHA/$CI_PROJECT_NAME
+
+.setchartvar: &setchartvar |-
+ if [ -z "$CP_HELM_DEPLOY_CHART" ]; then export _CP_HELM_DEPLOY_CHART=$CP_HELM_CHART ; else export _CP_HELM_DEPLOY_CHART=$CP_HELM_DEPLOY_CHART  ; fi
+
+.nexusuploaddir: &nexusuploaddir |-
+ echo "Uploading to $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_NAME "
+ find . -type f -exec curl -u $CP_NEXUS_USER --upload-file {} $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_NAME/{} \;
+
+.nexusremovedir: &nexusremovedir |-
+  find . -type f -exec curl -u $CP_NEXUS_USER -X DELETE $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_NAME/{} \;
+
+.helmpackage: &helmpackage |-
+  cd $CP_HELM_CHART_DIR
+  mkdir package
+  helm package $CP_HELM_CHART --destination ./package
+  echo $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_NAME/$(basename ./package/*.tgz) > ${CI_PROJECT_DIR}/helm.url
+  if ! [ -z "$CI_COMMIT_TAG" ]; then curl --fail $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_NAME/index.yaml --output ./package/merge.yaml || export CP_HELM_COMMAND_OPT=""; fi
+  echo "package created for url $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_NAME and options $CP_HELM_COMMAND_OPT"  
+  helm repo index ./package --url $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_NAME $CP_HELM_COMMAND_OPT
+  if [ -a ./package/merge.yaml ]; then rm ./package/merge.yaml; fi
+  cd package
+
+
+ # Uses Runners IAM  Role profile and AWS CLI with AWS IAM Authenticator to dynamically set .kube/config for EKS 
+.beforeeks: &beforeeks |-
+    aws eks --region $CP_K8S_REGION update-kubeconfig --name $CP_K8S_CLUSTER
+    aws --version
+    aws sts get-caller-identity
+    $CP_K8S_VERBOSE && kubectl cluster-info
+    helm tiller install
+    helm tiller start-ci $CP_K8S_NAMESPACE
+    export HELM_HOST=127.0.0.1:44134
+    export TILLER_NAMESPACE=$CP_K8S_NAMESPACE
+    helm repo update
+    helm version
+
+
+# Report the state of the deployment
+.aftereks: &aftereks |-
+    $CP_K8S_VERBOSE && kubectl get deployments --namespace $CP_K8S_NAMESPACE
+    $CP_K8S_VERBOSE && kubectl describe  -n kube-system configmap/aws-auth
+    $CP_K8S_VERBOSE && for item in $( kubectl get deployment --namespace $CP_K8S_NAMESPACE --output=name); do kubectl describe $item --namespace $CP_K8S_NAMESPACE ; done
+    $CP_K8S_VERBOSE && helm status $HELM_RELEASE_NAME || true
+    helm tiller stop || true
+
+
+.cp-helm-validate:
+  script:
+    - helm lint $CP_HELM_CHART_DIR/$CP_HELM_CHART
+
+.cp-helm-options:
+  before_script: 
+    - *setrepooptions
+
+.cp-helm-publish-temp:
+  script:
+   - *settemprepo
+   - *helmpackage
+   - *nexusuploaddir
+
+
+.cp-helm-publish:
+  script:
+   - *setrepooptions
+   - *helmpackage
+   - *nexusuploaddir
+
+
+.cp-helm-cleanup-temp:
+  script:
+    - *settemprepo
+    - *helmpackage
+    - *nexusremovedir
+
+.cp-manual-helm-base:
+  image: $CP_JOBIMAGE_K8S
+  when: manual
+  except:
+    variables:
+      - $ACTION != ""
+
+
+.cp-manual-helm:
+  extends: .cp-manual-helm-base
+  before_script:
+    - *beforeeks
+
+.cp-manual-helm-deploy:
+  extends: .cp-manual-helm
+  script:
+    - *setchartvar
+    - helm repo add $CP_HELM_REPO_NAME $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_PATH
+    - helm upgrade --install --force --namespace $CP_K8S_NAMESPACE $CP_HELM_DEPLOY_OPTIONS --values $CP_HELM_VALUES_DIR/$CP_HELM_VALUES_FILE $CP_HELM_RELEASE_NAME $CP_HELM_REPO_NAME/$_CP_HELM_DEPLOY_CHART
+    - *aftereks
+
+.cp-manual-helm-delete:
+  extends: .cp-manual-helm-base
+  except: []
+  only:
+    variables:
+      - $ACTION == "DELETE_K8S"
+  before_script:
+    - *beforeeks
+  script:
+    - helm delete --purge $CP_HELM_RELEASE_NAME
+    - *aftereks
+
+##########
+# Helm 3 #
+########## 
+.beforeeksh3: &beforeeksh3 |-
+    aws eks --region $CP_K8S_REGION update-kubeconfig --name $CP_K8S_CLUSTER
+    aws --version
+    aws sts get-caller-identity
+    $CP_K8S_VERBOSE && kubectl cluster-info
+    helm version  
+
+.aftereksh3: &aftereksh3 |-
+    $CP_K8S_VERBOSE && kubectl get deployments --namespace $CP_K8S_NAMESPACE
+    $CP_K8S_VERBOSE && kubectl describe  -n kube-system configmap/aws-auth
+    $CP_K8S_VERBOSE && for item in $( kubectl get deployment --namespace $CP_K8S_NAMESPACE --output=name); do kubectl describe $item --namespace $CP_K8S_NAMESPACE ; done
+    $CP_K8S_VERBOSE && helm status $HELM_RELEASE_NAME || true 
+
+
+.cp-manual-helm3-base:
+  image: $CP_JOBIMAGE_K8S_H3
+  when: manual
+  except:
+    variables:
+      - $ACTION != ""
+
+
+.cp-helm3-validate:
+  image: $CP_JOBIMAGE_K8S_H3
+  script:
+    - helm lint $CP_HELM_CHART_DIR/$CP_HELM_CHART
+
+
+.cp-manual-helm3:
+  extends: .cp-manual-helm3-base
+  before_script:
+   - *beforeeksh3
+
+
+.cp-manual-helm3-deploy:
+  extends: .cp-manual-helm3
+  script:
+    - *setchartvar
+    - helm repo add $CP_HELM_REPO_NAME $CP_NEXUS_HELM_BASE_URL/$CP_HELM_REPO_PATH
+    - helm upgrade --install --force --namespace $CP_K8S_NAMESPACE $CP_HELM_DEPLOY_OPTIONS --values $CP_HELM_VALUES_DIR/$CP_HELM_VALUES_FILE $CP_HELM_RELEASE_NAME $CP_HELM_REPO_NAME/$_CP_HELM_DEPLOY_CHART
+    - *aftereksh3
+
+
+.cp-manual-helm3-delete:
+  extends: .cp-manual-helm3
+  except: []
+  only:
+    variables:
+      - $ACTION == "DELETE_K8S"
+  script:
+    - helm delete --namespace $CP_K8S_NAMESPACE $CP_HELM_RELEASE_NAME
+  after_script:
+    - *aftereksh3
+
+
+#########################
+#   Terraform           #
+#########################
+.tfwrapscript: &tfwrapscript |-
+  python3 -c "
+  import os,json,shutil,datetime
+  PIPELINE_TERRAFORM_VERSION = os.getenv('TERRAFORM_VERSION')
+  print('PIPELINE_TERRAFORM_VERSION is ' + PIPELINE_TERRAFORM_VERSION)
+  modules = []
+  if os.path.exists('./.terraform/modules/modules.json'):
+   modulesFile = open('./.terraform/modules/modules.json')
+   modules = json.loads(modulesFile.read())['Modules']
+  newPackageDir='./tftemp/'
+  os.makedirs(newPackageDir,exist_ok=True)
+  wrapedModules = {}
+  for filename in list(filter(os.path.isfile, os.listdir('.') )):
+   filedata = []
+   print('FileName: ' + filename)
+   if filename in ['DS_Store', 'planfile','.terraform-version','.terraform.lock.hcl']:
+    continue
+   try:
+    with open(filename, 'r') as file :
+     filedata = file.read()
+    with open(newPackageDir+filename, 'w+') as file :
+     shutil.copymode(filename, newPackageDir+filename)
+     for module in modules :
+      textToSearch = module['Source']
+      if len(textToSearch) == 0 :
+        continue
+      textToReplace = './'+module['Dir'].replace('.terraform/', '')
+      if filedata.find(textToSearch):
+       if PIPELINE_TERRAFORM_VERSION == '11': 
+        wrapedModules[module['Root']]=module['Source']
+       else:
+        wrapedModules[module['Dir']]=module['Source'] 
+      filedata = filedata.replace(textToSearch,textToReplace)
+     file.write(filedata)
+   except UnicodeDecodeError:
+    print('UnicodeDecodeError, copying  ' + filename + ' to ' + newPackageDir+filename )
+    shutil.copyfile(filename, newPackageDir+filename)
+  for module in modules :
+   if PIPELINE_TERRAFORM_VERSION == '11': 
+    source= module['Dir']+'/'+module['Root']
+   else:
+    source= module['Dir'] 
+   dest= newPackageDir+module['Dir'].replace('.terraform/', '')
+   if not os.path.exists(dest):
+    shutil.copytree(source, dest)
+  with open(newPackageDir+'buildinfo.txt', 'a') as file :
+   file.write('Module sources\n'+datetime.datetime.utcnow().isoformat()+'Z\n'+json.dumps(wrapedModules))"
+
+.tfsetrepooptions: &tfsetrepooptions |-
+ if [ -z "$CI_COMMIT_TAG" ]; then if [[ "$CI_COMMIT_REF_SLUG" == "master" || "$CI_COMMIT_REF_SLUG" == "develop" ]]; then export TERRAFORM_REPO_NAME=ci ; else export TERRAFORM_REPO_NAME=ci-temp ; fi   else export TERRAFORM_REPO_NAME=stable ; fi
+
+.tfsetpackagename: &tfsetpackagename |-
+ export PACKAGE_NAME=$CP_TERRAFORM_MODULE_NAME-$CI_COMMIT_REF_SLUG$TERRAFORM_PACKAGE_EXT
+
+.tfsetvarfileoption: &tfsetvarfileoption |-
+ if [ -z "$CP_TERRAFORM_VAR_FILE" ]; then export CP_TERRAFORM_VAR_FILE_OPTION="" ;  else export CP_TERRAFORM_VAR_FILE_OPTION=-var-file=$CP_TERRAFORM_VAR_FILE ; fi
+
+.before_tf: &before_tf |-
+ export ROLE_CREDENTIALS=$(aws sts assume-role-with-web-identity --role-arn $AWS_ROLE_ARN --role-session-name ${CI_JOB_ID}-session --web-identity-token file://$AWS_WEB_IDENTITY_TOKEN_FILE)
+ export AWS_ACCESS_KEY_ID=$(echo $ROLE_CREDENTIALS | jq .Credentials.AccessKeyId | tr -d '"')
+ export AWS_SECRET_ACCESS_KEY=$(echo $ROLE_CREDENTIALS | jq .Credentials.SecretAccessKey | tr -d '"')
+ export AWS_SESSION_TOKEN=$(echo $ROLE_CREDENTIALS | jq .Credentials.SessionToken | tr -d '"')
+
+
+.tfupload: &tfupload
+  - cd $CP_TERRAFORM_MODULE_DIR
+  - mkdir package
+  - mkdir -p ./tftemp
+  - terraform get
+  - echo "Build Details" > buildinfo.txt
+  - echo "Revision $CI_COMMIT_SHA" >> buildinfo.txt
+  - echo "Tag $CI_COMMIT_REF_SLUG" >> buildinfo.txt 
+  - export CP_TERRAFORM_VERSION=$(terraform version); echo "CP_TERRAFORM_VERSION is $CP_TERRAFORM_VERSION"
+  - if [[ "$CP_TERRAFORM_VERSION" == *"0.11.15"* ]]; then export TERRAFORM_VERSION=11  ; else export TERRAFORM_VERSION=12 ; fi
+  - *tfwrapscript
+  - tar --exclude=./tests --exclude=terraform.tfvars --exclude=.gitlab-ci.yml --exclude=./deploy --exclude=./public --exclude=./.git --exclude=./package --exclude=*.html --exclude=./.terraform -C ./tftemp -cvjf ./package/$PACKAGE_NAME .  
+  - curl -sS --user $CP_NEXUS_USER --upload-file ./package/$PACKAGE_NAME  $CP_NEXUS_TERRAFORM_BASE_URL/$TERRAFORM_REPO_NAME/$PACKAGE_NAME
+  - echo $CP_NEXUS_TERRAFORM_BASE_URL/$TERRAFORM_REPO_NAME/$PACKAGE_NAME
+  - echo $CP_NEXUS_TERRAFORM_BASE_URL/$TERRAFORM_REPO_NAME/$PACKAGE_NAME > ${CI_PROJECT_DIR}/terraform.url
+  - rm -rf ./tftemp  
+  - rm -rf ./package
+  - rm buildinfo.txt
+
+.tfvalidate: &tfvalidate
+  - cd $CP_TERRAFORM_MODULE_DIR 
+  - $CP_TERRAFORM_INIT_SCRIPT
+  - terraform validate $CP_TERRAFORM_VALIDATE_OPTIONS . 
+
+.tfplan: &tfplan
+  - cd $CP_TERRAFORM_MODULE_DIR 
+  - $CP_TERRAFORM_INIT_SCRIPT
+  - *tfsetvarfileoption
+  - terraform plan -refresh=true -out "planfile" $CP_TERRAFORM_VAR_FILE_OPTION $CP_TERRAFORM_PLAN_OPTIONS . 
+
+
+.tfapply: &tfapply
+  - cd $CP_TERRAFORM_MODULE_DIR
+  - $CP_TERRAFORM_INIT_SCRIPT
+  - terraform apply -refresh=true -input=false -auto-approve $CP_TERRAFORM_APPLY_OPTIONS "planfile"  
+
+.tfdelete: &tfdelete
+  - cd $CP_TERRAFORM_MODULE_DIR 
+  - $CP_TERRAFORM_INIT_SCRIPT
+  - terraform destroy -auto-approve $CP_TERRAFORM_DELETE_OPTIONS . 
+
+
+.cp-terraform-base:
+  image: $CP_JOBIMAGE_TERRAFORM
+  when: on_success
+  before_script:
+    - *before_tf
+  except:
+    variables:
+      - $ACTION != ""
+
+
+.cp-terraform-test:
+  extends: .cp-terraform-base
+  image: $CP_JOBIMAGE_TERRAFORM_TEST
+  script:
+    - if [[ -d $CP_TERRAFORM_TEST_DIR ]] ; then cd $CP_TERRAFORM_TEST_DIR ; fi && if [ $(ls *.go | wc -l) -gt 0 ] ; then go test ; else echo "no tests found" ; fi
+
+
+.cp-terraform-validate:
+  extends: .cp-terraform-base
+  script:
+    - *tfvalidate
+
+
+.cp-terraform-publish:
+  extends: .cp-terraform-base
+  script:
+   - *tfsetrepooptions
+   - *tfsetpackagename
+   - *tfupload
+
+.cp-terraform-options:
+  before_script: 
+    - *before_tf
+    - *tfsetrepooptions
+    - *tfsetpackagename
+
+# Deployment jobs
+
+
+
+
+.cp-terraform-validate:
+  extends: .cp-terraform-base
+  script:
+    - *tfvalidate
+
+
+.cp-terraform-plan:
+  extends: .cp-terraform-base
+  script:
+    - *tfplan
+  artifacts:
+    paths:
+      -  $CP_TERRAFORM_MODULE_DIR/planfile
+
+
+.cp-terraform-apply:
+  extends: .cp-terraform-base
+  script:
+    - *tfapply
+
+
+.cp-terraform-delete:
+  extends: .cp-terraform-base
+  except: []
+  only:
+    variables:
+      - $ACTION == "DELETE_AWS"
+  before_script:
+    - *before_tf
+    - *tfdelete
+  script: 
+    - echo ""
+
+# manual jobs 
+
+.cp-manual-terraform-validate:
+  extends: .cp-terraform-validate
+  when: manual
+
+
+.cp-manual-terraform-plan:
+  extends: .cp-terraform-plan
+  when: manual
+
+
+.cp-manual-terraform-apply:
+  extends: .cp-terraform-apply
+  when: manual
+
+
+.cp-manual-terraform-delete:
+  extends: .cp-terraform-delete
+  when: manual
