@@ -1,0 +1,667 @@
+Config:
+aws-dev.json
+911 bytes
+{
+  "casclient@0": {
+    "noderedis": {
+      "url": "to_be_defined",
+      "password": "to_be_defined",
+      "tls": true
+    },
+    "expressSession": {
+      "secret": "to_be_defined",
+      "cookie": {
+        "domain": "web.us-east-1.dev.sase.securitysvcs.verizon.com",
+        "secure": false
+      }
+    }
+  },
+  "dbconnection": {
+    "knex": {
+      "enabled": true,
+      "client": "pg",
+      "searchPath": ["knex", "public"],
+      "connection": {
+        "database": "mcp",
+        "host": "to_be_defined",
+        "port": 5432,
+        "user": "mcps",
+        "password": "to_be_defined"
+      },
+      "migrations": {
+        "directory": "migrations",
+        "tableName": "mcps_migrations"
+      }
+    }
+  },
+  "multicloud": {
+    "sessionEnabled": true,
+    "cachePolicy": {
+      "isEnabled": true,
+      "keyPrefix": "mc:calls",
+      "defaultExpire": 900,
+      "methodExpire": {}
+    }
+  }
+}
+
+default.json
+1.57 KiB
+{
+  "casclient@0": {
+    "noderedis": {
+      "socket": {
+        "connectTimeout": 5000
+      }
+    },
+    "expressSession": {
+      "saveUninitialized": false,
+      "name": "cas",
+      "cookie": {
+        "httpOnly": true,
+        "maxAge": 900000,
+        "secure": true
+      }
+    }
+  },
+  "dbconnection": {
+    "knex": {
+      "enabled": true,
+      "client": "pg",
+      "searchPath": ["knex", "public"],
+      "connection": {
+        "database": "mcp",
+        "host": "to_be_defined",
+        "port": 5432,
+        "user": "mcps",
+        "password": "to_be_defined"
+      },
+      "migrations": {
+        "directory": "migrations",
+        "tableName": "mcps_migrations"
+      }
+    }
+  },
+  "multicloud": {
+    "sessionEnabled": false,
+    "cachePolicy": {
+      "isEnabled": false,
+      "keyPrefix": "mc:calls",
+      "defaultExpire": 900,
+      "methodExpire": {}
+    },
+    "datasources": {
+      "retry": {
+        "maxRetry": 5,
+        "errorCodes": [
+          500,
+          400
+        ],
+        "retryDelayInMins": 2
+      }
+    },
+    "authorisationPolicy": {
+      "Query": {
+        "*": "hasCloudAccess"
+      }
+    },
+    "usp": {
+      "productfilter": [
+        "MWAN",
+        "VNS",
+        "Advanced SASE Management"
+      ]
+    }
+  },
+  "web-server": {
+    "hostname": "0.0.0.0",
+    "port": 5042,
+    "title": "node: asf-multicloud",
+    "routeBase": "",
+    "name": "multicloud-default"
+  },
+  "options": {
+      "stats": {
+        "enabled": false
+      },
+      "cluster": {
+        "enabled": false
+    }
+  },
+  "public": {
+    "idp": {
+      "saml": false
+    }
+  }
+}
+
+multicloud-api
+scripts
+aws_secrets_mgr.sh
+aws_secrets_mgr.sh
+2.61 KiB
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+#!/bin/sh
+## This script gets secrets from aws secrets manager and parses them into the appropriate environment config files
+SECRET_ID_NAME=$1
+KMS_SECRET_ID_NAME=$2
+AWS_CONFIG_PATH=/usr/app/config/$3.json
+REDIS_SECRET_ID_NAME=$4
+EXPRESS_SECRET_ID_NAME=$5
+sleep 10
+HOST=`aws --region us-east-1 secretsmanager get-secret-value --secret-id $SECRET_ID_NAME --query SecretString | jq -r 'fromjson | ."host"'`
+if [ "$?" = "0" ]; then
+    jq --arg VAR1 "$HOST" '.dbconnection.knex.connection.host = $VAR1' $AWS_CONFIG_PATH > $AWS_CONFIG_PATH.tmp && cp $AWS_CONFIG_PATH.tmp $AWS_CONFIG_PATH
+else
+    echo "Cannot get primary aurora endpoint from aws secrets manager" 1>&2
+	exit 1
+fi
+PASSWORD=`aws --region us-east-1 secretsmanager get-secret-value --secret-id $SECRET_ID_NAME  --query SecretString | jq -r 'fromjson | ."password"'`
+if [ "$?" = "0" ]; then
+    jq --arg VAR2 "$PASSWORD" '.dbconnection.knex.connection.password = $VAR2' $AWS_CONFIG_PATH > $AWS_CONFIG_PATH.tmp && cp $AWS_CONFIG_PATH.tmp $AWS_CONFIG_PATH
+    rm $AWS_CONFIG_PATH.tmp
+else
+    echo "Cannot get aurora password from aws secrets manager" 1>&2
+	exit 1
+fi
+REDIS_URL="rediss://"`aws --region us-east-1 secretsmanager get-secret-value --secret-id $REDIS_SECRET_ID_NAME --query SecretString | jq -r 'fromjson | ."primary_endpoint_address"'`":6379"
+if [ "$?" = "0" ]; then
+    jq --arg VAR3 "$REDIS_URL" '."casclient@0".noderedis.url = $VAR3' $AWS_CONFIG_PATH > $AWS_CONFIG_PATH.tmp && cp $AWS_CONFIG_PATH.tmp $AWS_CONFIG_PATH
+else
+    echo "Cannot get Redis URL from aws secrets manager" 1>&2
+	exit 1
+fi
+REDIS_PASSWORD=`aws --region us-east-1 secretsmanager get-secret-value --secret-id $REDIS_SECRET_ID_NAME --query SecretString | jq -r 'fromjson | ."auth_token"'`
+if [ "$?" = "0" ]; then
+    jq --arg VAR4 "$REDIS_PASSWORD" '."casclient@0".noderedis.password = $VAR4' $AWS_CONFIG_PATH > $AWS_CONFIG_PATH.tmp && cp $AWS_CONFIG_PATH.tmp $AWS_CONFIG_PATH
+    rm $AWS_CONFIG_PATH.tmp
+else
+    echo "Cannot get Redis password from aws secrets manager" 1>&2
+	exit 1
+fi
+EXPRESS_SECRET=`aws --region us-east-1 secretsmanager get-secret-value --secret-id $EXPRESS_SECRET_ID_NAME --query SecretString | jq -r 'fromjson | ."secret"'`
+if [ "$?" = "0" ]; then
+    jq --arg VAR5 "$EXPRESS_SECRET" '."casclient@0".expressSession.secret = $VAR5' $AWS_CONFIG_PATH > $AWS_CONFIG_PATH.tmp && cp $AWS_CONFIG_PATH.tmp $AWS_CONFIG_PATH
+    rm $AWS_CONFIG_PATH.tmp
+else
+    echo "Cannot get Express secret from aws secrets manager" 1>&2
+	exit 1
+fi
+# echo "DB HOST"= $HOST
+# echo "DB PASSWORD: "= $PASSWORD
+# echo "REDIS URL: "= $REDIS_URL
+# echo "REDIS PASSWORD: "= $REDIS_PASSWORD
+# echo "EXPRESS SECRET: "= $EXPRESS_SECRET
+
+.gitlab-ci.yml
+4.95 KiB
+include:
+  - project: 'iac/common/common-pipeline'
+    ref: master
+    file: '/cijobs/applications.yml'
+variables:
+  APP_NAME: mcs
+  SONARQUBE_PROJECT_KEY: AF:Service:MCS
+  REPOSITORY_URL: 264741752173.dkr.ecr.us-east-1.amazonaws.com/af/mc-api
+ 
+stages:
+  - quality
+  - build
+#  - trigger_integration_tests
+  - trigger_deployment_pipeline
+  - twistlock_security_scan
+  - publish
+services:
+  - docker:stable-dind
+quality:
+  stage: quality
+  extends: .cp-sonar-scan-npm
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+  allow_failure: false
+  tags:
+    - leda-k8s-nonprod
+.build:container_defaults: &build_container_defaults
+  stage: build
+  tags:
+    - leda-k8s-nonprod
+  script:
+    - echo $CI_ENVIRONMENT_NAME
+    - docker build . --build-arg ENV=$NODE_ENV --build-arg SECRET=$SECRET --build-arg KMS_SECRET=$KMS_SECRET --build-arg REDIS_SECRET_ID_NAME=$REDIS_SECRET_ID_NAME --build-arg EXPRESS_SECRET_ID_NAME=$EXPRESS_SECRET_ID_NAME --tag $REPOSITORY_URL:$CI_COMMIT_SHORT_SHA-$ENVIRONMENT
+    - docker push $REPOSITORY_URL:$CI_COMMIT_SHORT_SHA-$ENVIRONMENT
+.tl_security_scan:defaults: &tl_security_scan_defaults
+  extends: .cp-twistlock-scan
+  before_script:
+    - IMAGE_TO_SCAN=$REPOSITORY_URL:$CI_COMMIT_SHORT_SHA-$ENVIRONMENT
+# trigger_integration_tests_dev:
+#   stage: trigger_integration_tests
+#   only:
+#     - develop
+#   variables:
+#     MULTICLOUD_IMAGE_TAG: $CI_COMMIT_SHORT_SHA-dev
+#     MULTICLOUD_INTEGRATION_TESTS: "multicloud-integration-tests==0.1.dev11+gc1f36e5"
+#   trigger:
+#     project: iac/multicloud/multicloud-integration-test-runner
+#     branch: develop
+#     strategy: depend
+#   allow_failure: true
+# trigger_integration_tests_int:
+#   stage: trigger_integration_tests
+#   only:
+#     - master
+#   variables:
+#     MULTICLOUD_IMAGE_TAG: $CI_COMMIT_SHORT_SHA-int
+#     MULTICLOUD_INTEGRATION_TESTS: "multicloud-integration-tests=="
+#   trigger:
+#     project: iac/multicloud/multicloud-integration-test-runner
+#     branch: master
+#     strategy: depend
+#   allow_failure: true
+trigger_deployment_pipeline_dev:
+  stage: trigger_deployment_pipeline
+  only:
+    - develop
+  variables:
+    MULTICLOUD_IMAGE_TAG: $CI_COMMIT_SHORT_SHA-dev
+  trigger:
+    project: iac/deployment-pipelines/af/services/multiclouds-deployment-pipeline
+    branch: develop
+    strategy: depend
+trigger_deployment_pipeline_int:
+  stage: trigger_deployment_pipeline
+  only:
+    - master
+  variables:
+    MULTICLOUD_IMAGE_TAG: $CI_COMMIT_SHORT_SHA-int
+  trigger:
+    project: iac/deployment-pipelines/af/services/multiclouds-deployment-pipeline
+    branch: master
+    strategy: depend
+publish:
+  extends: .cp-build-id
+  stage: publish
+  only:
+    - master
+  script:
+    - cp src/service/models/schemaTypes.ts resources/publish/lib/index.d.ts
+    - cd  resources/publish/
+    - npm version prerelease --preid $BUILD_ID
+    - npm publish
+.devci_defaults: &devci_defaults
+  tags:
+    - leda-k8s-nonprod
+  only:
+    - branches
+  except:
+    - master
+  variables:
+    REPOSITORY_URL: 264741752173.dkr.ecr.us-east-1.amazonaws.com/af/mc-api
+    IMAGE_FOLDER: af
+    DOCKER_TLS_CERTDIR: ""
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_SDK_LOAD_CONFIG: "true"
+    ENVIRONMENT: dev
+    NODE_ENV: aws-dev
+    SECRET: vz-vss-mcdev1/rds_secrets
+    KMS_SECRET: arn:aws:secretsmanager:us-east-1:493418970112:secret:vz-vss-mcdev1/rds_secrets-iWffxN
+    REDIS_SECRET_ID_NAME: vz-vss-sase-dev-us-east-1-redis-key
+    EXPRESS_SECRET_ID_NAME: vz-vss-sase-int-us-east-1-sases-saml-cookies-secret
+.intci_defaults: &intci_defaults
+  tags:
+    - leda-k8s-nonprod
+  only:
+    - master
+  variables:
+    REPOSITORY_URL: 264741752173.dkr.ecr.us-east-1.amazonaws.com/af/mc-api
+    IMAGE_FOLDER: af
+    DOCKER_TLS_CERTDIR: ""
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_SDK_LOAD_CONFIG: "true"
+    ENVIRONMENT: int
+    NODE_ENV: aws-int
+    SECRET: vz-vss-mcint1/rds_secrets
+    KMS_SECRET: arn:aws:secretsmanager:us-east-1:493418970112:secret:vz-vss-mcint1/rds_secrets-30P7CV
+    REDIS_SECRET_ID_NAME: vz-vss-sase-int-us-east-1-redis-key
+    EXPRESS_SECRET_ID_NAME: vz-vss-sase-int-us-east-1-sases-saml-cookies-secret
+.prodci_defaults: &prodci_defaults
+  tags:
+    - leda-k8s-nonprod
+  only:
+    - tags
+  when: manual
+  variables:
+    REPOSITORY_URL: 264741752173.dkr.ecr.us-east-1.amazonaws.com/af/mc-api
+    IMAGE_FOLDER: af
+    DOCKER_TLS_CERTDIR: ""
+    AWS_SDK_LOAD_CONFIG: "true"
+    ENVIRONMENT: prod
+    NODE_ENV: aws-prod
+    SECRET: 
+    KMS_SECRET: 
+    REDIS_SECRET_ID_NAME: 
+    EXPRESS_SECRET_ID_NAME:
+build:container:devci:
+  <<: *devci_defaults
+  <<: *build_container_defaults
+build:container:intci:
+  <<: *intci_defaults
+  <<: *build_container_defaults
+build:container:prodci:
+  <<: *prodci_defaults
+  <<: *build_container_defaults
+twistlock:security_devci:
+  <<: *devci_defaults
+  <<: *tl_security_scan_defaults
+twistlock:security_intci:
+  <<: *intci_defaults
+  <<: *tl_security_scan_defaults
+twistlock:security_prodci:
+  <<: *prodci_defaults
+  <<: *tl_security_scan_defaults
+  
+  gitignore
+591 bytes
+/resources/vendor/sevone/client/models
+# dependencies
+/node_modules
+# local build
+/dist
+/build
+# IDEs and editors
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+# misc
+/.nyc_output
+/.sass-cache
+/connect.lock
+/coverage
+/lib
+/libpeerconnection.log
+/mochawesome-report
+/typings
+xunit.xml
+*.log
+# System Files
+.DS_Store
+Thumbs.db
+# Project specific
+.nvm-node
+#versa api mock code
+versa_api_mock/sase-integration-test-runner/
+#knexfile
+/knexfile.js
+
+Dockerfile
+1.73 KiB
+FROM 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/nodejs-base:3.17-18.13.0-0 as base
+WORKDIR /usr/app
+RUN chown node:node  .
+USER node
+FROM base as build_base
+COPY --chown=node:node . .
+FROM build_base as builder
+RUN npm ci --legacy-peer-deps
+RUN npm run build
+FROM build_base as prod_dependencies
+RUN npm ci --legacy-peer-deps --only=production --ignore-scripts
+RUN find /usr/app/node_modules/ -iname *.key | xargs rm -f  \
+   && find /usr/app/node_modules/ -iname key.pem | xargs rm -f
+FROM base as final
+USER root
+RUN apk update && apk upgrade
+RUN npm update -g
+RUN find  /usr/local/lib/node_modules -iname *.key | grep test | xargs rm -f  \
+   && find  /usr/local/lib/node_modules -iname key.pem | grep test | xargs rm -f
+USER node
+#db related
+ARG ENV
+ARG SECRET
+ARG KMS_SECRET
+ARG REDIS_SECRET_ID_NAME
+ARG EXPRESS_SECRET_ID_NAME
+ENV SECRET_NAME=${SECRET}
+ENV KMS_SECRET_NAME=${KMS_SECRET}
+ENV NODE_ENV=${ENV}
+ENV REDIS_SECRET_NAME=${REDIS_SECRET_ID_NAME}
+ENV EXPRESS_SECRET_NAME=${EXPRESS_SECRET_ID_NAME}
+EXPOSE 5042
+COPY --from=prod_dependencies  --chown=node:node /usr/app/node_modules ./node_modules
+COPY --from=builder  --chown=node:node /usr/app/.npmrc /usr/app/package*.json /usr/app/server.js ./
+COPY --from=builder  --chown=node:node /usr/app/build ./build
+COPY --from=builder --chown=node:node /usr/app/config ./config
+COPY --from=builder --chown=node:node /usr/app/migrations ./migrations
+# Moving npm start to inside startup.sh: This is a trick to keep the docker image alive in Kubernetes
+COPY --chown=node:node scripts/startup.sh /usr/app
+COPY --chown=node:node scripts/aws_secrets_mgr.sh /usr/app
+RUN chmod +x /usr/app/startup.sh
+RUN chmod +x /usr/app/aws_secrets_mgr.sh
+CMD npm run awssecret && npm run migrate  && npm run start
+
+package.json
+5.11 KiB
+{
+  "name": "multicloud-api",
+  "version": "1.0.0",
+  "description": "multicloud-api",
+  "main": "index.js",
+  "author": "",
+  "license": "UNLICENSED",
+  "scripts": {
+    "awssecret": "/usr/app/aws_secrets_mgr.sh  $SECRET_NAME $KMS_SECRET_NAME $NODE_ENV $REDIS_SECRET_NAME $EXPRESS_SECRET_NAME",
+    "start": "node server.js",
+    "dev": "ts-node-dev --transpile-only --no-notify --exit-child src/index.ts",
+    "schemaupdate": "graphql-markdown  --title 'MultiCloud API GraphQL Schema ' http://localhost:5042/graphql/ > docs/scema.md &&  graphql-codegen --config codegen.yaml",
+    "generate": "ts-node --transpile-only src/schema.ts",
+    "nvm": "~/.nvm/nvm-exec which node | xargs -I % ln -sf % ./.nvm-node && chmod +x ./.nvm-node",
+    "start:local": "node server.js --ext-config=localhost.json --local",
+    "start:aws-dev": "node server.js --ext-config=aws-dev.json --local",
+    "start:aws-int": "node server.js --ext-config=aws-int.json --local",
+    "migrate": "migrate --config ./config/$NODE_ENV.json latest",
+    "watch": "tsc -watch",
+    "prebuild": "npm run clean",
+    "build": "tsc",
+    "clean": "rm -rf ./dist ./build",
+    "validate": "nyc --check-coverage --per-file --lines 90 --statements 80 --functions 100 --branches 80 npm test",
+    "test": "nyc --check-coverage --per-file --lines 00 --statements 00 --functions 00 --branches 00 mocha --timeout 50000 --reporter=dot -r ts-node/register -r source-map-support/register \"src/**/*.spec.ts\"",
+    "posttest": "nyc report --reporter=lcov --reporter=text-summary",
+    "prettier": "npx prettier --write ./src",
+    "prettier-check": "npx prettier --check ./src || true",
+    "lint": "npx eslint -c .eslintrc.js --resolve-plugins-relative-to ./node_modules/@vz/code-quality --ext .ts ./src",
+    "release": "np"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://git.services.securitysvcs.verizon.com/af/services/multicloud-api.git"
+  },
+  "nyc": {
+    "all": true,
+    "extension": [
+      ".ts"
+    ],
+    "include": [
+      "src/**/*.ts"
+    ],
+    "exclude": [
+      "**/src/constants/**",
+      "**/coverage/**",
+      "**/mochawesome-report/**",
+      "**/*.spec.ts",
+      "**/src/index.ts",
+      "*.js",
+      "**/src/*.js",
+      "**/src/utilities/logger.ts",
+      "**/src/graphql/resolvers.ts",
+      "**/src/utilities/secretsconfig.ts",
+      "**/src/service/models/schemaTypes.ts",
+      "**/src/utilities/DependencyRegistry.ts"
+    ]
+  },
+  "private": true,
+  "keywords": [],
+  "dependencies": {
+    "@graphql-tools/schema": "8.5.1",
+    "@graphql-tools/utils": "8.9.0",
+    "@vz/casclient": "0.1.1-45.0",
+    "@vz/knex-utils": "1.5.3-dev",
+    "@vz/log": "^7.5.0",
+    "@vz/node-asf-sign": "^4.0.0",
+    "@vz/webserver": "^10.4.5",
+    "apollo-datasource": "3.3.2",
+    "apollo-server-core": "^3.6.3",
+    "apollo-server-express": "^3.6.3",
+    "aws-sdk": "2.1117.0",
+    "axios": "0.26.1",
+    "axios-oauth-client": "1.5.0",
+    "axios-retry": "^3.2.4",
+    "axios-time": "1.0.0",
+    "axios-token-interceptor": "0.2.0",
+    "class-transformer": "0.5.1",
+    "cookie-parser": "1.4.6",
+    "date-fns": "2.28.0",
+    "doctrine": "0.7.2",
+    "express": "4.18.2",
+    "express-session": "1.17.3",
+    "graphql": "16.3.0",
+    "graphql-middleware": "6.1.32",
+    "graphql-scalar": "0.0.11",
+    "graphql-scalars": "1.17.0",
+    "graphql-shield": "7.5.0",
+    "haversine-distance": "1.2.1",
+    "http-cookie-agent": "1.0.5",
+    "https-proxy-agent": "5.0.1",
+    "humps": "2.0.1",
+    "husky": "7.0.4",
+    "knex": "2.4.0",
+    "log4js": "6.4.4",
+    "node-fetch": "3.2.10",
+    "passport": "0.6.0",
+    "pg": "^8.8.0",
+    "prom-client": "14.0.1",
+    "redis": "4.3.1",
+    "reflect-metadata": "0.1.13",
+    "tough-cookie": "4.0.0",
+    "tslib": "1.9.0",
+    "tsyringe": "4.6.0"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-secrets-manager": "3.76.0",
+    "@graphql-codegen/cli": "2.6.2",
+    "@graphql-codegen/schema-ast": "2.4.1",
+    "@graphql-codegen/typescript": "2.5.1",
+    "@graphql-eslint/eslint-plugin": "3.10.3",
+    "@types/axios-token-interceptor": "0.2.3",
+    "@types/chai": "4.3.0",
+    "@types/chai-as-promised": "7.1.5",
+    "@types/cookie-parser": "1.4.3",
+    "@types/express": "^4.17.11",
+    "@types/express-session": "1.17.5",
+    "@types/humps": "2.0.1",
+    "@types/lodash": "^4.14.120",
+    "@types/mocha": "^9.0.0",
+    "@types/nconf": "^0.10.0",
+    "@types/node": "^16.11.22",
+    "@types/passport": "1.0.11",
+    "@types/passport-strategy": "0.2.35",
+    "@types/pg": "^7.14.11",
+    "@types/request": "^2.48.1",
+    "@types/request-promise-native": "^1.0.16",
+    "@types/sinon": "10.0.11",
+    "@vz/code-quality": "4.0.3",
+    "axios-mock-adapter": "1.21.1",
+    "chai": "4.3.6",
+    "chai-as-promised": "7.1.1",
+    "cross-env": "7.0.3",
+    "graphql-markdown": "5.2.0",
+    "maketypes": "1.1.2",
+    "mocha": "^9.2.2",
+    "node-mocks-http": "^1.10.1",
+    "nyc": "^15.1.0",
+    "prettier": "2.6.2",
+    "pretty-quick": "3.1.3",
+    "sinon": "^9.2.4",
+    "ts-node": "^10.2.1",
+    "ts-node-dev": "^1.1.8",
+    "ts-sinon": "2.0.2",
+    "tslint": "^6.1.3",
+    "typescript": "^4.3.5"
+  },
+  "overrides": {
+    "graphql": "16.3.0",
+    "passport": "0.6.0"
+  },
+  "directories": {
+    "doc": "docs"
+  }
+}
