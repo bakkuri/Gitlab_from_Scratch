@@ -1,0 +1,269 @@
+include:
+  - project: 'iac/common/common-pipeline'
+    ref: master
+    file: '/cijobs/helm.yml'
+
+variables:
+  CP_HELM_CHART: mcs
+
+stages:
+  - validate
+  - publish
+  - report
+helm-charts/name:
+chart.yml
+apiVersion: v1
+description: A helm chart for MULTICLOUD Service Rest API
+name: mcs
+version: 0.0.2
+
+values.yml
+# serviceAccountName -- Determines the service account under which the containers will run. Can be set to cluster default with {}, atlas-default is {{ .Release.Namespace }}-service
+# forcedRedeployTime -- Mechanism to force redeployment when there are no other configuration changes, to use update to current date and time.
+# mcs.port -- LMS API Kubernetes Service port
+# mcs.internalport -- LMS API internal application port
+# mcs.livenessInitialDelaySeconds -- Delay before K8S runs the liveness probe for the first time
+# mcs.replicas -- Number of pods to create in the Kubernetes Deployment
+# mcs.node_env -- NODE_ENV environment variable
+# mcs.debug_env -- DEBUG environment variable
+# mcs.image -- Docker image for the LMS API
+# mcs.rds_secret_name -- Name of the AWS Secret Manager secret that contains the RDS dbname, password and host
+# mcs.rvs_secret_name -- Name of the AWS Secret Manager secret that contains the RVS KeyId and secretKey
+# k8s.nodeselector -- Restrict nodes on which to deploy
+# k8s.ingressclassName -- Kubernetes Ingress class name to target
+# k8s.ingresspath -- Kubernetes Ingress path to target
+# k8s.pathType -- Kuberneties path type
+# k8s.ingresshost -- Kubernetes Ingress host to target
+
+serviceAccountName: mc-dev-service
+forcedRedeployTime: "1970-01-01T00:00:00Z"
+mcs:
+  serviceName: "mcs"
+  port: 80
+  internalport: 5040
+  livenessInitialDelaySeconds: 11
+  replicas: 3
+  rds_secret_name: ""
+  rvs_secret_name: ""
+  rvsurl: ""
+  acsurl: ""  
+  node_env: "app-default"
+  node_tls: "0"
+  debug_env: ""
+  image:
+    repository: "repository/af/mcs"
+    tag: "latest"
+
+versa:
+  analytics:
+    url: ""
+    secretname: ""
+  director:
+    url: ""
+    secretname: ""
+
+prisma:
+  auth:
+    url: ""
+    tsgid: ""
+    secretname: ""
+  sase:
+    url: ""
+    
+k8s:
+  nodeselector: { }
+  ingressClassName: ""
+  ingresspath: "/mcs"
+  pathType: ImplementationSpecific
+  ingresshost: ""
+
+templates/helpers.tpl
+{{- define "mcs.name" -}}
+{{- .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "mcs.instance" -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "mcs.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "mcs.selectors" -}}
+app.kubernetes.io/instance: {{ include "mcs.instance" . }}
+{{- end -}}
+
+{{/*  Manage the labels for each entity  */}}
+{{- define "mcs.labels" -}}
+{{ include "mcs.selectors" . }}
+app.kubernetes.io/name: {{ include "mcs.name" . }}
+helm.sh/chart: {{ include "mcs.chart" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "mcs.serviceAccountName" -}}
+{{- if .Values.serviceAccountName }}
+{{- if eq .Values.serviceAccountName "atlas-default" }}
+serviceAccountName: {{ .Release.Namespace }}-service
+{{else}}
+serviceAccountName: {{ .Values.serviceAccountName }}
+{{- end -}}
+{{- end -}}       
+{{- end -}}
+
+mcs-deployment.yaml
+2.48 KiB
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ template "mcs.instance" . }}
+  labels:
+{{ include "mcs.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.mcs.replicas }}
+  selector:
+    matchLabels:
+{{ include "mcs.selectors" . | indent 6 }}
+  template:
+    metadata:
+      annotations:
+        atlas.verizon.com/forced-redeploy-time: {{ .Values.forcedRedeployTime }}
+        traffic.sidecar.istio.io/excludeOutboundPorts: "9182,8443"
+      labels:
+{{ include "mcs.labels" . | indent 8 }}
+    spec:
+      affinity:
+        podAntiAffinity:
+         preferredDuringSchedulingIgnoredDuringExecution:
+         - podAffinityTerm:
+             labelSelector:
+               matchExpressions:
+               - key: app.kubernetes.io/name
+                 operator: In
+                 values:
+                 - {{ include "mcs.name" . }} 
+             topologyKey: failure-domain.beta.kubernetes.io/zone
+           weight: 100       
+      securityContext:
+        fsGroup: 1000
+{{ include "mcs.serviceAccountName" . | indent 6 }}
+      containers:
+      - name: mcs
+        image: {{ .Values.mcs.image.repository }}:{{ .Values.mcs.image.tag }}
+        securityContext:
+            runAsUser: 1000
+        ports:
+            - name: http
+              containerPort: {{ .Values.mcs.internalport }}
+              protocol: TCP
+        env:
+          {{- if .Values.mcs.node_tls }}
+          - name:  NODE_TLS_REJECT_UNAUTHORIZED
+            value: "{{ .Values.mcs.node_tls }}"
+          {{- end -}}
+          {{- if .Values.mcs.node_env }}
+          - name:  NODE_ENV
+            value: "{{ .Values.mcs.node_env }}"
+          {{- end -}}
+          {{- if .Values.mcs.rds_secret_name }}
+          - name:  RDS_SECRET_NAME
+            value: "{{ .Values.mcs.rds_secret_name }}"
+          {{- end -}}
+          {{- if .Values.mcs.rvs_secret_name }}
+          - name:  RVS_SECRET_NAME
+          value: "{{ .Values.mcs.rvs_secret_name }}"
+          {{- end -}}
+          {{- if .Values.mcs.debug_env }}
+          - name:  DEBUG
+            value: "{{ .Values.mcs.debug_env }}"
+          {{- end -}}
+          {{- if .Values.mcs.rvsurl }}
+          - name:  vz_asf_rvs_url
+            value: "{{ .Values.mcs.rvsurl }}"
+          {{- end -}}
+          {{- if .Values.mcs.acsurl }}
+          - name:  vz_asf_acs_url
+            value: "{{ .Values.mcs.acsurl }}"
+          {{- end -}}
+      {{- if .Values.k8s.nodeselector }}
+    {{- with .Values.k8s.nodeselector }}
+      nodeSelector:
+{{ toYaml . | indent 8 }}
+    {{- end }}
+      {{- end -}}
+      mcs-ingress.yaml
+1.01 KiB
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ template "mcs.instance" . }}
+  labels:
+{{ include "mcs.labels" . | indent 4 }}  
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/service-upstream: "true"
+{{- if .Values.mcs.serviceName }}
+    nginx.ingress.kubernetes.io/upstream-vhost: {{ .Values.mcs.serviceName }}.{{.Release.Namespace}}
+{{- else }}
+    nginx.ingress.kubernetes.io/upstream-vhost: {{ template "mcs.instance" . }}.{{.Release.Namespace}}
+{{- end }}
+spec:
+  ingressClassName: {{ .Values.k8s.ingressClassName }}
+  rules:
+  - host: {{ .Values.k8s.ingresshost }}
+    http:
+      paths:
+      - path: {{ .Values.k8s.ingresspath }}(/|$)(.*)
+        pathType: {{ .Values.k8s.pathType }}
+        backend:
+{{- if .Values.mcs.serviceName }}
+          service:
+            name: {{ .Values.mcs.serviceName }}
+{{- else }}
+          service:
+            name: {{ template "mcs.instance" . }}
+{{- end }}
+            port:
+              number: {{ .Values.mcs.port }}
+              
+mcs-service.yaml
+417 bytes
+apiVersion: v1
+kind: Service
+metadata:
+{{- if .Values.mcs.serviceName }}
+  name: {{ .Values.mcs.serviceName }}
+{{- else }}
+  name: {{ template "mcs.instance" . }}
+{{- end }}  
+  labels:
+{{ include "mcs.labels" . | indent 4 }}
+spec:
+  selector:
+{{ include "mcs.selectors" . | indent 4 }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.mcs.port }}
+      targetPort: {{ .Values.mcs.internalport }}
+      
+ apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ template "mcs.instance" . }}
+  labels:
+{{ include "mcs.labels" . | indent 4 }}
+spec:
+  selector:
+    matchLabels:
+{{ include "mcs.selectors" . | indent 6 }}
+  endpoints:
+  - port:  http
+    path: /metrics
+
+
