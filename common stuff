@@ -1,3 +1,5 @@
+common gitlab
+
 stages:
   - test-helm-validate
   - test-helm-publish
@@ -614,3 +616,174 @@ include:
 .cp-manual-terraform-delete:
   extends: .cp-terraform-delete
   when: manual
+
+
+cd deployments:
+deployment.yml
+602 bytes
+include:
+  - local: '/config/jobimage.yml'
+  - local: '/config/k8s.yml'
+  - local: '/config/nexus.yml'
+  - local: '/config/report.yml'
+  - local: 'jobs/lib.yml'
+variables:
+ CP_TERRAFORM_MODULE_DIR: terraform
+ CP_TERRAFORM_INIT_SCRIPT: "terraform init -reconfigure -input=false"
+ CP_TERRAFORM_VAR_FILE: ""
+ CP_TERRAFORM_PLAN_OPTIONS: ""
+ CP_TERRAFORM_APPLY_OPTIONS: ""
+ CP_TERRAFORM_DELETE_OPTIONS: ""
+ CP_HELM_VALUES_DIR: helm
+ CP_HELM_REPO_NAME: atlas
+ CP_HELM_REPO_PATH: /stable
+ CP_HELM_DEPLOY_OPTIONS: ""
+ # CP_K8S_NAMESPACE: "" # Required to be set in client
+ CP_K8S_VERBOSE: "false"
+ ACTION: ""
+ 
+ CI app.yml
+ 
+ include:
+  - local: '/config/jobimage.yml'
+  - local: '/config/report.yml'
+  - local: '/config/sonar.yml'
+  - local: '/config/twistlock.yml'
+  - local: '/jobs/lib.yml'
+
+variables:
+ ACTION: ""
+
+
+helm.yml
+include:
+  - local: '/config/jobimage.yml'
+  - local: '/config/k8s.yml'
+  - local: '/config/nexus.yml'
+  - local: '/jobs/lib.yml'
+  - local: '/config/report.yml'
+
+image: $CP_JOBIMAGE_K8S
+
+
+variables:
+ CP_HELM_CHART_DIR: helm-charts
+ ACTION: ""
+
+stages:
+  - validate
+  - publish
+  - report
+
+
+helm-validate:
+  stage: validate
+  extends: .cp-helm-validate
+
+
+helm-publish:
+ stage: publish
+ resource_group: nexus
+ extends: .cp-helm-publish
+ artifacts:
+  expire_in: 4 hours
+  paths:
+    - ./helm.url 
+
+report:
+  stage: report
+  before_script: 
+    - export CP_REPORT_COMPONENT_KEY=${CP_HELM_CHART^^} && export CP_REPORT_COMPONENT_KEY=$CP_REPORT_COMPONENT_KEY'_HELM'
+  extends: .cp-reporting
+  when: always
+
+
+terraform.yml
+include:
+  - local: '/config/jobimage.yml'
+  - local: '/config/k8s.yml'
+  - local: '/config/nexus.yml'
+  - local: '/jobs/lib.yml'
+  - local: '/config/report.yml'
+
+image: $CP_JOBIMAGE_TERRAFORM
+
+variables:
+ CP_TERRAFORM_MODULE_DIR: terraform
+ CP_TERRAFORM_TEST_DIR: test
+ CP_TERRAFORM_MODULE_NAME: "common-pipeline" # Required to be set in client
+ CP_TERRAFORM_INIT_SCRIPT: "terraform init -reconfigure -input=false"
+ CP_TERRAFORM_VALIDATE_OPTIONS: ""
+ TERRAFORM_PACKAGE_EXT: ".tar.bz2"
+ ACTION: ""
+
+
+stages:
+ - validate
+ - test
+ - publish
+ - report
+
+terraform-validate:
+  stage: validate
+  extends: .cp-terraform-validate
+
+
+terraform-test:
+  stage: test
+  extends: .cp-terraform-test
+
+
+terraform-publish:
+ stage: publish
+ extends: .cp-terraform-publish
+ artifacts:
+  expire_in: 4 hours
+  paths:
+    - ./terraform.url  
+
+report:
+ stage: report
+ before_script: 
+   - export CP_REPORT_COMPONENT_KEY=${CP_TERRAFORM_MODULE_NAME^^} && export CP_REPORT_COMPONENT_KEY=$CP_REPORT_COMPONENT_KEY'_TERRAFORM'
+ extends: .cp-reporting
+ when: always
+
+config::
+jobimage.yml
+variables:
+ CP_JOBIMAGE_K8S: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/helm-aws-cli-kubectl:latest
+ CP_JOBIMAGE_K8S_H3: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/gitlab-runner-base:v1.0.6
+ CP_JOBIMAGE_TERRAFORM: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/gitlab-runner-base:v1.0.9
+ CP_JOBIMAGE_TERRAFORM_TEST: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/gitlab-runner-base:v1.0.9
+ CP_JOBIMAGE_DOCKER: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/gitlab-runner-base:v1.0.11
+ CP_JOBIMAGE_REPORT: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/gitlab-runner-base:v1.0.10
+ # Note reporting also done by twistlock job
+ CP_JOBIMAGE_TWIST_LOCK: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/gitlab-runner-base:v1.0.12
+ CP_JOBIMAGE_SONAR: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/sq-base:3.14-0
+ CP_JOBIMAGE_RDSUTILS: 264741752173.dkr.ecr.us-east-1.amazonaws.com/vss-base-images/gitlab-runner-base:v1.0.22
+
+
+k8yml
+variables:
+ CP_K8S_REGION: "us-east-1"
+ CP_K8S_CLUSTER: "vz-vss-eks-v3-atlas-non-prod"
+
+nexus
+variables:
+ CP_NEXUS_USER: "gitlab:set_in_gitlab_var"
+ CP_NEXUS_HELM_BASE_URL: "https://nex.services.securitysvcs.verizon.com/repository/helm"
+ CP_NEXUS_TERRAFORM_BASE_URL: "https://nex.services.securitysvcs.verizon.com/repository/terraform"
+ CP_NEXUS_API_BASE_URL: "https://nex.services.securitysvcs.verizon.com/service/rest"
+
+twist
+variables:
+  CP_TWISTLOCK_HOST: https://twi.services.securitysvcs.verizon.com
+  DOCKER_CLIENT_ADDRESS: tcp://localhost:2375
+  DOCKER_TLS_CERTDIR: ''
+  CP_DOCKER_OPTS: --label support=$CP_DOCKER_LABEL_SUPPORT
+
+sonar:
+variables:
+ SONARQUBE_EXCLUSIONS: 'node_modules/**/*,**/*.spec.ts,coverage/**/*,PhantomJS*/**/*,reports/**/*,tools/**/*,e2e/**/*,**/*.d.ts,**/*.mock.ts,migrations/**/*,scripts/**/*'
+ SONARQUBE_URL: https://son.services.securitysvcs.verizon.com
