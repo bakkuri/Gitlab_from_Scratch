@@ -1,0 +1,521 @@
+gitlab-ci.yml
+1.49 KiB
+include:
+  - project: 'iac/common/common-pipeline'
+    ref: master
+    file: '/cdjobs/deployment.yml'
+variables:
+  ENVIRONMENT: dev
+  MULTICLOUD_IMAGE_TAG: "14b66a1d-develop"
+  CP_TERRAFORM_MODULE_NAME: mcps
+  CP_TERRAFORM_MODULE_DIR: terraform/tf_aurora
+  CP_TERRAFORM_INIT_SCRIPT: ./tf_init.sh
+  CP_TERRAFORM_VAR_FILE: dev.tfvars
+  CP_HELM_RELEASE_NAME: mcs-dev
+  CP_HELM_REPO_PATH: ci/develop/multiclouds-helm
+  CP_HELM_CHART: mcs
+  CP_HELM_VALUES_FILE: mcs-dev.yaml
+  CP_K8S_NAMESPACE: "mc-dev"
+  CP_K8S_CLUSTER: vz-vss-leda-eks-v3-new-dev
+  CP_HELM_DEPLOY_OPTIONS: " --set mcs.image.tag=$MULTICLOUD_IMAGE_TAG"
+stages:
+ - plan-aws
+ - deploy-aws
+ - delete-aws
+ - check-trigger
+ - deploy-k8s
+ - delete-k8s
+plan-aws:
+  stage: plan-aws
+  extends: .cp-manual-terraform-plan
+  tags:
+    - leda-k8s-nonprod
+deploy-aws:
+  stage: deploy-aws
+  extends: .cp-manual-terraform-apply
+  tags:
+    - leda-k8s-nonprod
+delete-aws:
+  stage: delete-aws
+  tags:
+    - leda-k8s-nonprod
+  variables:
+    ENVIRONMENT: dev  
+  extends: .cp-manual-terraform-delete
+check-trigger:
+  stage: check-trigger
+  except: 
+   variables:
+     - $CI_PIPELINE_SOURCE == "pipeline"
+  script:
+    - echo "The deployment of should be triggered by applicaiton pipeline to set the docker image tag"
+    - "true"
+deploy-k8s-dev:
+  stage: deploy-k8s
+  tags:
+   - leda-k8s-nonprod 
+  only:
+    - develop
+  extends: .cp-manual-helm3-deploy
+  when: always
+delete-k8s-dev:
+  stage: delete-k8s
+  tags:
+   - leda-k8s-nonprod
+  extends: .cp-manual-helm3-delete
+
+
+multiclouds-deployment-pipeline
+helm
+mcs-dev.yaml
+mcs-dev.yaml
+830 bytes
+# mcs.port -- SASE API Kubernetes Service port
+# mcs.internalport -- SASE API internal application port
+# mcs.replicas -- Number of pods to create in the Kubernetes Deployment
+# mcs.node_env -- NODE_ENV environment variable
+# mcs.image -- Docker image for the SASE API
+# k8s.nodeselector -- Restrict nodes on which to deploy
+# k8s.ingressclass -- Kubernetes Ingress class to target
+# k8s.ingresspath -- Kubernetes Ingress path to target
+# k8s.ingresshost -- Kubernetes Ingress host to target
+mcs:
+  internalport: 5042
+  replicas: 1
+  node_env: "aws-dev"
+  image:
+    repository: "264741752173.dkr.ecr.us-east-1.amazonaws.com/af/mc-api"
+    tag: "latest"
+k8s:
+  nodeselector: { }
+  ingressClassName: "nginx-ext-ingress-dev"
+  ingresspath: "/mcs"
+  pathType: Prefix
+  ingresshost: "web.us-east-1.dev.sase.securitysvcs.verizon.com"
+  
+  terraform
+tf_aurora
+dev.tfvars
+dev.tfvars
+4.28 KiB
+#This file specifies the environment specific variables
+# VPC and Subnet Details
+vpcid   = "vpc-017b6d1a61a0a0d66"
+subnets = ["subnet-0f2190e930346741a","subnet-0a37fafdc0b361185","subnet-0e4cb2129b7c9ab8a"] 
+# Start kms variables
+mcps_kms_description           = "AWS KMS for Aurora DB for the mcps projects."
+mcps_kms_deletion_windows_days = "30"
+mcps_kms_enable_key_rotation   = "true"
+mcps_kms_alias_name            = "alias/vz_vss_mcp_rds_kms_dev"
+# End kms variables
+# Start tags
+mcps_kms_tags = {
+  "Name"           = "vz-vss-mcp-dev1",
+  "Team"           = "Multicloud",
+  "Userid"         = "v918833",
+  "Email"          = "AtlasTitanProdSupport@verizon.com",
+  "Purpose"        = "Key for RDS mcps Postgresql DB",
+  "Vsad"           = "J1LV",
+  "Environment"    = "Nonprod"
+  "Level"          = "Dev1",
+  "Organization"   = "VSS"
+  "Role"           = "DB"
+}
+# End tags
+# Start aurora.tf variables
+mcps_rds_aurora_name                      = "vz-vss-mc-dev1-mcps-rds-01"
+mcps_rds_database_name                    = "mcp"
+mcps_rds_aurora_eng                       = "aurora-postgresql"
+mcps_rds_aurora_eng_version               = "13.7"
+mcps_rds_aurora_storage_encrypt           = "true"
+mcps_rds_aurora_replica_count             = "3"
+mcps_rds_aurora_replica_autoscaling       = "false"
+mcps_rds_aurora_replica_scale_min         = "2"
+mcps_rds_aurora_replica_scale_max         = "4"
+mcps_rds_aurora_deletion_protection       = "false"
+iam_database_authentication_enabled       = "true"
+mcps_rds_aurora_monitoring_interval       = "60"
+mcps_rds_aurora_instance_type             = "db.r6g.2xlarge"
+mcps_rds_aurora_cloudwatch_create_alarms  = "true"
+# End aurora.tf variables
+# Start DB user, secrets, sgs details start
+mcps_user_name                            = "mcps"
+mcps_secret_name                          = "vz-vss-mcdev1/rds_secrets"
+allowed_security_groups                   = ["sg-02c989ff77cb60cf0","sg-0c8d61e68c6b7c331","sg-0c5148cf0c40fd366","sg-000616bff17780548","sg-0c80dbf34602c8df9","sg-0cc07733b88ecb3c7","sg-031bbd80105aedf40"]
+aurora_mcps_rds_deletion_protection       = "false"
+enhanced_monitoring_role_arn              = "arn:aws:iam::493418970112:role/vz-vss-rds-aurora-monitoring-role"   
+# End DB user, secrets, sgs details start
+# Start tags
+mcps_rds_aurora_tags = {
+  "Name"           = "vz-vss-mcp_rds_aurora_dev1",
+  "Team"           = "Multicloud",
+  "Userid"         = "v918833",
+  "Email"          = "AtlasTitanProdSupport@verizon.com",
+  "Purpose"        = "Key for RDS mcps Postgresql DB",
+  "Vsad"           = "J1LV",
+  "Environment"    = "Nonprod"
+  "Level"          = "Dev1",
+  "Organization"   = "VSS"
+  "Role"           = "DB"
+}
+# End tags
+# Start aurora.tf variables
+aurora_mcps_postgresdb_paramater_group_01_name   = "vz-vss-mcp-dev-postgresdb-paramater-group"
+aurora_mcps_postgresdb_paramater_group_01_family = "aurora-postgresql13"
+aurora_mcps_postgresdb_paramater_group_01_desc   = "Aurora mcps dev DB parameter group"
+aurora_mcps_postgresdb_cluster_01_name           = "vz-vss-mcp-dev-postgresdb-cluster"
+aurora_mcps_postgresdb_cluster_01_family         = "aurora-postgresql13"
+aurora_mcps_postgresdb_cluster_01_desc           = "Aurora mcps dev DB cluster group"
+aurora_mcps_rds_aurora_apply_immediately         = "true"
+# End aurora.tf variables
+# Start cloudwatch.tf variables
+cloudwatch_mcps_cloudwatch_name                          = "vz-vss-mcp-dev-cloudwatch"
+cloudwatch_mcps_cloudwatch_retention_in_days             = "30"
+cloudwatch_mcps_cloudwatch_stream_names                  = ["postgresql"]
+cloudwatch_mcps_cloudwatch_iam_role_name                 = "mcps"
+cloudwatch_mcps_cloudwatch_iam_role_policy_name          = "logs"
+cloudwatch_mcps_cloudwatch_principal_service_identifiers = ["cloudtrail.amazonaws.com","vpc-flow-logs.amazonaws.com"]
+cloudwatch_mcps_cloudwatch_sns                           = "vz-vss-dev-mcp-monitoring"
+# End cloudwatch.tf variables
+# Cloudwatch tags
+cloudwatch_mcps_cloudwatch_tags                          = {
+  "Name"           = "vz-vss-mcp_cloudwatch_dev",
+  "Team"           = "Multicloud",
+  "Userid"         = "v918833",
+  "Email"          = "AtlasTitanProdSupport@verizon.com",
+  "Purpose"        = "Key for RDS mcps Postgresql DB",
+  "Vsad"           = "J1LV",
+  "Environment"    = "Nonprod"
+  "Level"          = "Dev1",
+  "Organization"   = "VSS"
+  "Role"           = "DB"
+}
+
+main.tf
+3.83 KiB
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+provider "aws" {
+  region = "us-east-1"
+  version = "v2.70.0"
+}
+provider "random" {
+  version = "2.3.1"
+}
+terraform {
+  required_version = "0.11.15"
+  backend "s3" {}
+}
+module "mcps" {
+  source = "https://nex.services.securitysvcs.verizon.com/repository/terraform/ci/mcps-develop.tar.bz2"
+  mcps_rds_aurora_name                      = "${var.mcps_rds_aurora_name}"
+  mcps_rds_aurora_eng                       = "${var.mcps_rds_aurora_eng}"
+  mcps_rds_aurora_eng_version               = "${var.mcps_rds_aurora_eng_version}"
+  vpcid                                     = "${var.vpcid}"
+  subnets                                   = ["${var.subnets}"]
+  mcps_rds_aurora_storage_encrypt           = "${var.mcps_rds_aurora_storage_encrypt}"
+  mcps_rds_aurora_replica_count             = "${var.mcps_rds_aurora_replica_count}"
+  mcps_rds_aurora_replica_autoscaling       = "${var.mcps_rds_aurora_replica_autoscaling}"
+  mcps_rds_aurora_replica_scale_min         = "${var.mcps_rds_aurora_replica_scale_min}"
+  mcps_rds_aurora_replica_scale_max         = "${var.mcps_rds_aurora_replica_scale_max}"
+  mcps_rds_aurora_deletion_protection       = "${var.mcps_rds_aurora_deletion_protection}"
+  mcps_rds_aurora_monitoring_interval       = "${var.mcps_rds_aurora_monitoring_interval}"
+  mcps_rds_aurora_instance_type             = "${var.mcps_rds_aurora_instance_type}"
+  cloudwatch_mcps_cloudwatch_stream_names   = "${var.cloudwatch_mcps_cloudwatch_stream_names}"
+  mcps_user_name                            = "${var.mcps_user_name}"
+  mcps_rds_database_name                    = "${var.mcps_rds_database_name}"
+  mcps_secret_name                          = "${var.mcps_secret_name}"
+  mcps_rds_aurora_deletion_protection       = "${var.mcps_rds_aurora_deletion_protection}"
+  iam_database_authentication_enabled       = "${var.iam_database_authentication_enabled}"
+  enhanced_monitoring_role_arn              = "${var.enhanced_monitoring_role_arn}"
+  allowed_security_groups                   = "${var.allowed_security_groups}"
+  mcps_rds_aurora_tags                      = "${var.mcps_rds_aurora_tags}"
+  aurora_mcps_postgresdb_paramater_group_01_name    = "${var.aurora_mcps_postgresdb_paramater_group_01_name}"
+  aurora_mcps_postgresdb_paramater_group_01_family  = "${var.aurora_mcps_postgresdb_paramater_group_01_family}"
+  aurora_mcps_postgresdb_paramater_group_01_desc    = "${var.aurora_mcps_postgresdb_paramater_group_01_desc}"
+  aurora_mcps_postgresdb_cluster_01_name            = "${var.aurora_mcps_postgresdb_cluster_01_name}"
+  aurora_mcps_postgresdb_cluster_01_family          = "${var.aurora_mcps_postgresdb_cluster_01_family}"
+  aurora_mcps_postgresdb_cluster_01_desc            = "${var.aurora_mcps_postgresdb_cluster_01_desc}"
+  aurora_mcps_rds_aurora_apply_immediately          = "${var.aurora_mcps_rds_aurora_apply_immediately}"
+  
+  mcps_kms_description             = "${var.mcps_kms_description}"
+  mcps_kms_deletion_windows_days   = "${var.mcps_kms_deletion_windows_days}"
+  mcps_kms_enable_key_rotation     = "${var.mcps_kms_enable_key_rotation}"
+  mcps_kms_alias_name              = "${var.mcps_kms_alias_name}"
+  mcps_kms_tags                    = "${var.mcps_kms_tags}"
+  cloudwatch_mcps_cloudwatch_name                     = "${var.cloudwatch_mcps_cloudwatch_name}"
+  cloudwatch_mcps_cloudwatch_retention_in_days        = "${var.cloudwatch_mcps_cloudwatch_retention_in_days}"
+  cloudwatch_mcps_cloudwatch_iam_role_name            = "${var.cloudwatch_mcps_cloudwatch_iam_role_name}"
+  cloudwatch_mcps_cloudwatch_iam_role_policy_name     = "${var.cloudwatch_mcps_cloudwatch_iam_role_policy_name}"
+  cloudwatch_mcps_cloudwatch_sns                      = "${var.cloudwatch_mcps_cloudwatch_sns}"
+  mcps_rds_aurora_cloudwatch_create_alarms            = "${var.mcps_rds_aurora_cloudwatch_create_alarms}"
+  cloudwatch_mcps_cloudwatch_tags                     = "${var.cloudwatch_mcps_cloudwatch_tags}"
+  
+  tf_init.sh
+413 bytes
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+#!/usr/bin/env bash
+set -euo pipefail
+aws sts get-caller-identity
+# Initializes the terraform s3 backend
+terraform init \
+    -backend-config "key=mcp/${ENVIRONMENT}/pgdb" \
+    -backend-config "bucket=vz-vss-us-east-1-dev-leda-terraform-state" \
+    -backend-config "region=us-east-1" \
+    -backend-config "dynamodb_table=vz-vss-us-east-1-dev-leda-state-lock-dynamo" \
+    -reconfigure \
+    -input=false \
+
+
+variables.tf
+2.52 KiB
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+# Start Variables for aurora_kms.tf
+variable "mcps_kms_description" {}
+variable "mcps_kms_deletion_windows_days" {}
+variable "mcps_kms_enable_key_rotation" {}
+variable "mcps_kms_alias_name" {}
+variable "mcps_kms_tags" {
+  type    = "map"
+  default = {}
+}
+# End Variables for kms_aurora_key.tf
+# Start Variables for aurora.tf
+variable "mcps_rds_aurora_name" {}
+variable "mcps_rds_aurora_eng" {}
+variable "mcps_rds_aurora_eng_version" {}
+variable "mcps_rds_aurora_storage_encrypt" {}
+variable "mcps_rds_aurora_replica_count" {}
+variable "mcps_rds_aurora_replica_autoscaling" {}
+variable "mcps_rds_aurora_replica_scale_min" {}
+variable "mcps_rds_aurora_replica_scale_max" {}
+variable "mcps_rds_aurora_deletion_protection" {}
+variable "iam_database_authentication_enabled" {}
+variable "aurora_mcps_rds_aurora_apply_immediately" {}
+variable "mcps_rds_aurora_cloudwatch_create_alarms" {}
+variable "mcps_secret_name" {}
+variable "mcps_user_name" {}
+variable "mcps_rds_aurora_instance_type" {}
+variable "mcps_rds_aurora_monitoring_interval" {}
+variable "mcps_rds_database_name" {}
+variable "aurora_mcps_postgresdb_paramater_group_01_name" {}
+variable "aurora_mcps_postgresdb_paramater_group_01_family" {}
+variable "aurora_mcps_postgresdb_paramater_group_01_desc" {}
+variable "aurora_mcps_postgresdb_cluster_01_name" {}
+variable "aurora_mcps_postgresdb_cluster_01_family" {}
+variable "aurora_mcps_postgresdb_cluster_01_desc" {}
+variable "enhanced_monitoring_role_arn" {}
+variable "port" {
+  description = "The port on which to accept connections"
+  default     = ""
+}
+variable "mcps_rds_aurora_tags" {
+  type    = "map"
+  default = {}
+}
+variable "allowed_security_groups" {
+  type    = "list"
+  default = []
+}
+# End Variables for aurora.tf
+# Start Subnet data
+variable "vpcid" {}
+variable "subnets" {
+  type    = "list"
+  default = []
+}
+# End Subnet data
+# Start Variables for cloudwatch_aurora.tf
+variable "cloudwatch_mcps_cloudwatch_name" {}
+variable "cloudwatch_mcps_cloudwatch_retention_in_days" {}
+variable "cloudwatch_mcps_cloudwatch_stream_names" {
+  type    = "list"
+  default = []
+}
+variable "cloudwatch_mcps_cloudwatch_iam_role_name" {}
+variable "cloudwatch_mcps_cloudwatch_iam_role_policy_name" {}
+variable "cloudwatch_mcps_cloudwatch_principal_service_identifiers" {
+  type    = "list"
+  default = []
+}
+variable "cloudwatch_mcps_cloudwatch_sns" {}
+variable "cloudwatch_mcps_cloudwatch_tags" {
+  type    = "map"
+  default = {}
+}
+# End Variables for cloudwatch_aurora.tf
+variable "secret_map" {
+  default = {
+    key1 = "value1"
+    key2 = "value2"
+  }
+  type = "map"
+}
+
