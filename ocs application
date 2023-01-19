@@ -1,0 +1,715 @@
+gitlab-ci.yml
+5.35 KiB
+variables:
+  APP_NAME: ocs
+  SONARQUBE_PROJECT_KEY: ASF:OCS
+  PORT: 4016
+  DOCKER_STAGES: 'base dependencies builder runtime'
+  NODE_CONTAINER_DEV_IMAGE: $CI_REGISTRY/services/ocs/prod:latest
+  NODE_CONTAINER_STABLE_IMAGE: $CI_REGISTRY/services/ocs/prod:$CI_COMMIT_TAG
+stages:
+  - test
+  - quality
+  - build:container
+  - sysdig_scan
+  - deploy
+  - prod_release
+.runner_defaults: &runner_defaults
+  image: $CI_REGISTRY/devops/atlas/centos7-nodejs-rpm
+  tags:
+    - sonarqube
+.deploy:defaults: &deploy_defaults
+  image: kroniak/ssh-client
+  stage: deploy
+  before_script:
+    - mkdir -m 700 ~/.ssh
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$GITLAB_RUNNER_PRIVATE_KEY" | base64 -d)
+    - ssh-keyscan -H "$CI_ENVIRONMENT_URL"  >> ~/.ssh/known_hosts
+  script:
+    - ssh $CI_ENVIRONMENT_URL "bash -s" < ./node_modules/@vz/deploy/docker-deploy.sh gitlab-ci-token $CI_JOB_TOKEN $CI_REGISTRY $APP_NAME $CI_ENVIRONMENT_NAME $PORT $CI_REGISTRY_IMAGE
+.build:container_defaults: &build_container_defaults
+  stage: build:container
+  image: $CI_REGISTRY/devops/atlas/docker-bash
+  variables:
+    TAG: $CI_REGISTRY/$CI_PROJECT_PATH/$CI_ENVIRONMENT_NAME
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+  script:
+    - ./node_modules/@vz/deploy/docker-build.sh $CI_ENVIRONMENT_NAME $TAG $DOCKER_STAGES
+sysdig_scan:
+  image: $CI_REGISTRY/devops/atlas/docker-bash
+  stage: sysdig_scan
+  except:
+    - tags
+  services:
+    - docker:18.09.7-dind
+  before_script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker info
+    - apk add --no-cache util-linux curl bash openssh zip
+  script:
+    - if [ "$CI_COMMIT_REF_NAME" = "develop" ]; then SCAN_ENV=dev-ci; elif [ "$CI_COMMIT_REF_NAME" = "master" ]; then SCAN_ENV=dev-prod; else SCAN_ENV=dev-test; fi
+    - echo SCAN_ENV=$SCAN_ENV
+    - if [ -z "$IMAGE_TO_SCAN" ]; then IMAGE_TO_SCAN=$CI_REGISTRY/$CI_PROJECT_PATH/$SCAN_ENV:latest ; fi
+    - echo IMAGE_TO_SCAN=$IMAGE_TO_SCAN
+    - curl -LO "https://download.sysdig.com/scanning/bin/sysdig-cli-scanner/$(curl -L -s https://download.sysdig.com/scanning/sysdig-cli-scanner/latest_version.txt)/linux/amd64/sysdig-cli-scanner"
+    - chmod +x ./sysdig-cli-scanner
+    - SECURE_API_TOKEN=6a27749c-c50a-4209-abfa-28ba07d42e9b ./sysdig-cli-scanner --console-log --full-vulns-table -a https://app.us3.sysdig.com $IMAGE_TO_SCAN --output-json=${CI_PROJECT_DIR}/ocs_scan_results.json
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - ${CI_PROJECT_DIR}/ocs_scan_results.json
+test:
+  <<: *runner_defaults
+  except:
+    - tags
+  stage: test
+  before_script:
+    - npm ci
+  script:
+    - npm version
+    - npm run lint
+    - npm test
+  artifacts:
+    expire_in: 4 hours
+    paths:
+      - ./node_modules/*
+      - ./coverage/*
+quality:
+  <<: *runner_defaults
+  except:
+    - tags
+  stage: quality
+  variables:
+    GIT_STRATEGY: clone
+  artifacts:
+    expire_in: 4 hours
+    paths:
+      - gl-sast-report.json
+  script:
+    - git config --global user.email $GITLAB_USER_EMAIL
+    - git config --global user.name $GITLAB_USER_NAME
+    - git fetch
+    - git checkout master
+    - git merge $CI_BUILD_REF --no-commit --no-ff
+    - npx sonar-scanner
+      -Dsonar.host.url=${SONARQUBE_URL}
+      -Dsonar.login=${SONARQUBE_TOKEN}
+      -Dsonar.analysis.mode=publish
+      -Dsonar.gitlab.user_token=${SONARQUBE_GITLAB_USER_TOKEN}
+      -Dsonar.gitlab.project_id=${CI_PROJECT_PATH}
+      -Dsonar.gitlab.commit_sha=${CI_COMMIT_SHA}
+      -Dsonar.gitlab.ref_name=${CI_COMMIT_REF_NAME}
+      -Dsonar.gitlab.json_mode=SAST
+      -Dsonar.gitlab.failure_notification_mode=exit-code
+      -Dsonar.gitlab.only_issue_from_commit_file=true
+      -Dsonar.sources=${CI_PROJECT_DIR}
+      -Dsonar.projectKey=${SONARQUBE_PROJECT_KEY}
+      -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+      -Dsonar.verbose=false
+      -Dsonar.exclusions='node_modules/**/*, **/*.spec.ts, coverage/**/*, **/*.d.ts'
+.devtest_defaults: &devtest_defaults
+  except:
+    - develop
+    - master
+    - tags
+  environment:
+    name: dev-test
+    url: dev-test-asf-us.vzbi.com
+.devci_defaults: &devci_defaults
+  only:
+    - develop
+  environment:
+    name: dev-ci
+    url: dev-ci-asf-us.vzbi.com
+.devprod_defaults: &devprod_defaults
+  only:
+    - master
+  environment:
+    name: dev-prod
+    url: dev-prod-asf-us.vzbi.com
+build:container:devtest:
+  <<: *devtest_defaults
+  <<: *build_container_defaults
+build:container:devci:
+  <<: *devci_defaults
+  <<: *build_container_defaults
+build:container:devprod:
+  <<: *devprod_defaults
+  <<: *build_container_defaults
+deploy:devtest:
+  <<: *devtest_defaults
+  <<: *deploy_defaults
+  only:
+    - devTesting
+deploy:devci:
+  <<: *devci_defaults
+  <<: *deploy_defaults
+deploy:devprod:
+  <<: *devprod_defaults
+  <<: *deploy_defaults
+release_stable:
+  image: kroniak/ssh-client
+  stage: prod_release
+  environment:
+    name: dev-prod
+    url: dev-prod-asf-us.vzbi.com
+  variables:
+    TAG: $CI_REGISTRY/$CI_PROJECT_PATH/$CI_ENVIRONMENT_NAME
+  services:
+    - docker:dind
+  before_script:
+    - mkdir -m 700 ~/.ssh
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$GITLAB_RUNNER_PRIVATE_KEY" | base64 -d)
+    - ssh-keyscan -H "$CI_ENVIRONMENT_URL"  >> ~/.ssh/known_hosts
+  script:
+    - echo "calling /root/ocs/stage_for_prod.sh"
+    - ssh -oStrictHostKeyChecking=no $CI_ENVIRONMENT_URL "/root/ocs/stage_for_prod.sh \"$CI_COMMIT_TAG\""
+  only:
+    - tags
+  except:
+    - branches
+    
+Dockerfile
+1.04 KiB
+FROM node:14.15.5-alpine3.12 as base
+WORKDIR /usr/app
+ARG ENV
+ENV NODE_ENV=${ENV}
+RUN mkdir -p /usr/app/mec/dest/
+FROM base as dependencies
+COPY ./package*.json ./.npmrc ./
+RUN npm ci --only=production
+RUN mv -f node_modules production_node_modules
+RUN npm ci
+COPY . .
+FROM base as builder
+COPY --from=dependencies /usr/app/node_modules ./node_modules
+COPY --from=dependencies /usr/app/package*.json ./
+COPY --from=dependencies /usr/app/tsconfig*.json ./
+COPY --from=dependencies /usr/app/src ./src
+COPY --from=dependencies /usr/app/scripts ./scripts
+RUN npm run build
+FROM base as runtime
+COPY --from=dependencies /usr/app/package*.json /usr/app/server.js ./
+COPY --from=dependencies /usr/app/config ./config
+COPY --from=dependencies /usr/app/production_node_modules ./node_modules
+COPY --from=builder /usr/app/build ./build
+COPY --from=dependencies /usr/app/scripts ./scripts
+#COPY --from=dependencies /usr/app/scripts/quotepull.sh /etc/cron.daily/quotepull.sh
+CMD /bin/chmod 0755 /usr/app/scripts/bin/ocs_cronjob_setup.sh; crond && npm run cronjob && npm start
+
+
+
+
+
+ocs
+config
+default.json
+user avatar
+updated essa url
+Sharma authored 5 months ago
+a3134c81
+default.json
+758 bytes
+{
+  "web-server": {
+    "hostname": "0.0.0.0",
+    "port": 4016,
+    "title": "node: asf-ocs",
+    "routeBase": "/ocs",
+    "connectorBase": "/vzw"
+  },
+  "essa": {
+    "baseurl": "https://166.59.83.11:8443/api",
+    "user": "ASFMicroSvcUser",
+    "password": "password"
+  },
+  "asfCms": {
+    "cmsUrl": "https://dev-ci-asf-us.vzbi.com/cms"
+  },
+  "companyDetailKeysMeta": [
+    {
+      "uuid": "c84de69d-f988-451f-b6fd-fc1299f11798",
+      "key": "gchId",
+      "name": "GCH ID",
+      "description": "GCH System Identifier",
+      "typeTags": "id_external"
+    },
+    {
+      "uuid": "fa004f82-ccd1-4dea-9fa9-0bcbd0251ca7",
+      "key": "ban",
+      "name": "BAN",
+      "description": "Billing Account Number",
+      "typeTags": "id_external"
+    }
+  ]
+}
+
+local.json
+82 bytes
+{
+  "asf": {
+    "rvs": {
+      "url": "http://localhost:4000/verify"
+    }
+  }
+}
+
+
+dev-ci.json
+5.78 KiB
+{
+  "web-server": {
+    "hostname": "0.0.0.0",
+    "port": 4016,
+    "title": "node: asf-ocs",
+    "routeBase": "/ocs",
+    "connectorBase": "/vrd"
+  },
+  "essa": {
+    "baseurl": "http://153.39.106.117:8080/api",
+    "user": "ASFMicroSvcUser",
+    "password": "password"
+  },
+  "asfCms": {
+    "cmsUrl": "https://dev-ci-asf-us.vzbi.com/cms"
+  },
+  "asfOms": {
+    "omsUrl": "https://dev-ci-asf-us.vzbi.com/oms"
+  },
+  "signOptions": {
+    "signatureType": "RSA-SHA512",
+    "keyId": "bbdb5f70-1b8f-4439-bfaa-b664334aa24f",
+    "secretKey": "-----BEGIN RSA PRIVATE KEY-----\n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\n-----END RSA PRIVATE KEY-----\n"
+  },
+  "orderSourceDetails": {
+    "jms": {
+      "url": "http://166.34.70.84:8080/secpws/services/secpws?wsdl",
+      "userName": "StunPortal",
+      "password": "manager123"
+    },
+    "vision": {
+      "url": "https://mcscmpalbt1.ebiz.verizon.com/apex/ApexServlet"
+    }
+  },
+  "awsSqsSnsOptions": {
+    "region": "us-east-1",
+    "sqsQueueUrl": "https://sqs.us-east-1.amazonaws.com/988689001866/sb_service_status_vrd_queue_dev"
+  },
+  "cmdbDetails": {
+    "url": "https://oa-uat.ebiz.verizon.com:443/cmdb/gsam",
+    "apikey": "N5tUgtEvB3TT7B5RziFX724kLHEZZSqb",
+    "sensitiveLevels": ["1"],
+    "sensitiveExcludeProdCodes": ["PR_CRM", "PR_DDOS"],
+    "rxConfig": {
+      "retry": 3,
+      "noResponseRetries": 2,
+      "retryDelay": 30
+    },
+    "httpProxy": {
+      "host": "",
+      "port": 3128,
+      "agent": true
+    }
+  },
+  "asfPcs": {
+    "pcsUrl": "https://dev-ci-asf-us.vzbi.com/pcs"
+  },
+  "asfFunps": {
+    "funpsUrl": "https://dev-ci-asf-us.vzbi.com/funps"
+  },
+  "pqServiceDetails": {
+    "pqUrl": "https://oa-uat.ebiz.verizon.com:443/ekyv-proquest-ssq2odiscoveryservices/SSQ2ODiscoveryIntOperation",
+    "pqServiceApiKey": "N5tUgtEvB3TT7B5RziFX724kLHEZZSqb",
+    "quoteSystemKey": "proquest",
+    "retryCount": 20,
+    "httpProxy": {
+      "host": "",
+      "port": 80,
+      "agent": true
+    }
+  },
+  "licenses": {
+    "tanium": 500,
+    "cylance": 500
+  },
+  "options": {
+    "cluster": {
+      "maxWorkerCount": 1
+    },
+    "stats": {
+      "enabled": true
+    }
+  },
+  "waitTime": 300000,
+  "proxy": {
+    "httpProxy": {
+      "host": "",
+      "port": 3128,
+      "agent": true
+    }
+  },
+  "companyDetailKeysMeta": [
+    {
+      "uuid": "c84de69d-f988-451f-b6fd-fc1299f11798",
+      "key": "gchId",
+      "name": "GCH ID",
+      "description": "GCH System Identifier",
+      "typeTags": "id_external"
+    },
+    {
+      "uuid": "fa004f82-ccd1-4dea-9fa9-0bcbd0251ca7",
+      "key": "ban",
+      "name": "BAN",
+      "description": "Billing Account Number",
+      "typeTags": "id_external"
+    }
+  ],
+  "missingRelationServiceProducts": ["PR_IDS"]
+}
+
+ocs
+scripts
+dev-ci
+quotepull.sh
+
+added cron script
+Shanlendra Parashar authored 1 year ago
+0991d2a6
+quotepull.sh
+166 bytes
+1
+2
+3
+4
+result=$(curl -X POST --header 'gracie_username:auto_sys' "Accept: */*" "https://dev-ci-asf-us.vzbi.com/ocs/vrd/quotes")
+echo "Response from server"
+echo $result
+exit
+
+dev-ci.conf
+1.29 KiB
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+# Specifies a directory to save any retrieved reports locally
+DEST=/usr/app/mec/dest/
+# The URL towards the ESSA API. Must not end in /
+# The below URL is for E0 env (non-prod) - it should be updated per env
+API_URL='http://166.59.83.112:8080/api'
+# The HTTP Basic Auth credentials for ESSA API logon
+HTTP_USER='ASFMicroSvcUser'
+HTTP_PASS='password'
+HTTP_PROXY=""
+HTTP_PROXYS=""
+# The URL towards the OCS connector , no trailing slash
+COLLECT_METRICS_URL=http://localhost:4016/ocs/scm/collectMetrics
+REPORTS_BILLING_URL=http://localhost:4016/ocs/scm/reports/billing
+QUOTE_PULL_URL=http://localhost:4016/ocs/vrd/quotes
+# Email distro list; Enter multiple mail ids seperated by commas
+EMAIL_DISTRO=rajagopal.narasimhan@one.verizon.com,alaap.sharma@one.verizon.com
+EMAIL_SERVER_URL=smtp.vzbi.com
+EMAIL_SERVER_PORT=25
+EMAIL_FROM_ADDRESS=noreply@verizon.com
+PRODUCT_VENDOR=MEC-VZ
+BMO_PVT_PRODUCT_KEY=PR_PRIVATE_MEC
+BMO_PUB_PRODUCT_KEY=PR_PUBLIC_MEC
+AWS_REVO_REPORT_METRIC_KEY=awsUsageCost
+AZURE_REVO_REPORT_METRIC_KEY=azureUsageCost
+# Specifies the directory to use for any log files
+LOG=/usr/app
+# Specifies the logfile of the script itself
+SCRIPT_LOG=${LOG}/ocs_scripts.log
+# Rerun status file
+RERUN_FILENAME=ocs_scripts_rerun
+## run mode true/false
+MANUALRUN="false"
+## LogAttach true/false
+LOGATTACH="false"
+
+prod.conf
+1.39 KiB
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+# Specifies a directory to save any retrieved reports locally
+DEST=/usr/app/mec/dest/
+# The URL towards the ESSA API. Must not end in /
+# The below URL is for E0 env (non-prod) - it should be updated per env
+API_URL='http://belt-gracie-essa-01v:8080/api'
+# The HTTP Basic Auth credentials for ESSA API logon
+HTTP_USER='ASFMicroSvcUser'
+HTTP_PASS='password'
+HTTP_PROXY="http://clp-proxy-01v.ops.cybertrust.com:8080"
+HTTP_PROXYS="http://clp-proxy-01v.ops.cybertrust.com:8080"
+# The URL towards the OCS connector , no trailing slash
+COLLECT_METRICS_URL=http://localhost:4016/ocs/scm/collectMetrics
+REPORTS_BILLING_URL=http://localhost:4016/ocs/scm/reports/billing
+QUOTE_PULL_URL=http://localhost:4016/ocs/vrd/quotes
+# Email distro list; Enter multiple mail ids seperated by commas
+EMAIL_DISTRO=rajagopal.narasimhan@one.verizon.com,AtlasBMOProdSupport@one.verizon.com
+EMAIL_SERVER_URL=smtp.vzbi.com
+EMAIL_SERVER_PORT=25
+EMAIL_FROM_ADDRESS=noreply@verizon.com
+PRODUCT_VENDOR=MEC-VZ
+BMO_PVT_PRODUCT_KEY=PR_PRIVATE_MEC
+BMO_PUB_PRODUCT_KEY=PR_PUBLIC_MEC
+AWS_REVO_REPORT_METRIC_KEY=awsUsageCost
+AZURE_REVO_REPORT_METRIC_KEY=azureUsageCost
+# Specifies the directory to use for any log files
+LOG=/usr/app
+# Specifies the logfile of the script itself
+SCRIPT_LOG=${LOG}/ocs_scripts.log
+# Rerun status file
+RERUN_FILENAME=ocs_scripts_rerun
+## run mode true/false
+MANUALRUN="false"
+## LogAttach true/false
+LOGATTACH="false"
+
+quotepull.sh
+157 bytes
+1
+2
+3
+4
+result=$(curl -X POST --header 'gracie_username:auto_sys' "Accept: */*" "http://localhost:4016/ocs/vrd/quotes")
+echo "Response from server"
+echo $result
+exit
+
+package.json
+3.15 KiB
+{
+  "name": "ocs",
+  "version": "1.23.0",
+  "description": "Order Connector Service",
+  "main": "server.js",
+  "author": "Werner Vermeylen (werner.vermeylen@be.verizon.com)",
+  "license": "UNLICENSED",
+  "scripts": {
+    "cronjob": "/usr/app/scripts/bin/ocs_cronjob_setup.sh $NODE_ENV",
+    "start": "node server.js",
+    "start:devci": "node server.js --ext-config=dev-ci.json",
+    "start:devlocal": "node server.js --ext-config=dev-local.json",
+    "start:devtest": "node server.js --ext-config=dev-test.json",
+    "start:devprod": "node server.js --ext-config=dev-prod.json",
+    "watch": "tsc -watch",
+    "remove": "rm -rf ./build",
+    "prebuild": "npm run remove",
+    "build": "tsc",
+    "test": "nyc mocha --reporter=dot -r ts-node/register -r source-map-support/register \"src/**/*.spec.ts\"",
+    "posttest": "nyc report --reporter=lcov --reporter=text-summary",
+    "lint": "tslint 'src/**/*.ts'",
+    "release": "np"
+  },
+  "husky": {
+    "hooks": {
+      "pre-commit": "pretty-quick --staged",
+      "post-commit": "git update-index -g"
+    }
+  },
+  "nyc": {
+    "extension": [
+      ".ts",
+      ".tsx"
+    ],
+    "exclude": [
+      "**/coverage/**",
+      "**/build/**",
+      "**/*.d.ts",
+      "**/*.spec.ts",
+      "**/__mock__/**",
+      "**/__fixture__/**",
+      "**/index.ts/**",
+      "*.js"
+    ],
+    "all": true
+  },
+  "private": true,
+  "dependencies": {
+    "@types/cls-hooked": "4.3.3",
+    "@types/qs": "6.9.7",
+    "@types/supertest": "2.0.11",
+    "@vz/log": "^7.3.0",
+    "@vz/node-asf-sign": "^3.6.0",
+    "@vz/node-asf-types": "^3.5.5",
+    "@vz/webserver": "^8.0.1",
+    "aws-sdk": "^2.850.0",
+    "axios": "^0.21.1",
+    "body-parser": "1.19.0",
+    "cls-hooked": "^4.2.2",
+    "cls-rtracer": "^1.4.1",
+    "express": "^4.17.1",
+    "express-xml-bodyparser": "0.3.0",
+    "lodash": "^4.17.21",
+    "md5": "2.2.1",
+    "pg": "^8.7.1",
+    "qs": "6.10.1",
+    "querystring": "0.2.1",
+    "request-promise": "4.2.4",
+    "request-promise-native": "1.0.5",
+    "retry-axios": "2.4.0",
+    "uuid": "8.3.2",
+    "xml2js": "0.4.22"
+  },
+  "devDependencies": {
+    "@types/chai": "4.1.6",
+    "@types/chai-as-promised": "7.1.0",
+    "@types/express": "^4.17.13",
+    "@types/express-xml-bodyparser": "0.3.0",
+    "@types/form-data": "2.5.0",
+    "@types/lodash": "^4.14.172",
+    "@types/md5": "2.1.33",
+    "@types/mocha": "^8.2.3",
+    "@types/multer": "1.3.7",
+    "@types/nconf": "0.10.0",
+    "@types/node": "^12.20.21",
+    "@types/pg": "^7.14.11",
+    "@types/request": "2.48.3",
+    "@types/request-promise-native": "1.0.15",
+    "@types/sinon": "5.0.3",
+    "@types/swagger-ui-express": "3.0.0",
+    "@types/uuid": "3.4.3",
+    "@types/xml2js": "0.4.5",
+    "@types/yamljs": "^0.2.30",
+    "@vz/code-quality": "^3.2.0",
+    "@vz/deploy": "^2.6.1",
+    "@vz/node-asf-types": "^3.1.27",
+    "chai": "4.2.0",
+    "chai-as-promised": "7.1.1",
+    "form-data": "2.5.0",
+    "husky": "^6.0.0",
+    "mocha": "^8.4.0",
+    "nyc": "^15.1.0",
+    "pretty-quick": "1.10.0",
+    "sinon": "9.2.4",
+    "sonar-scanner": "3.1.0",
+    "supertest": "6.1.6",
+    "ts-node": "7.0.1",
+    "tslint-config-prettier": "1.18.0",
+    "tslint-no-unused-expression-chai": "0.1.3",
+    "typescript": "4.4.2"
+  }
+}
+
+
+server.js
+42 bytes
+module.exports = require('./build/index');
+
+docker-compose.yml
+440 bytes
+version: '2'
+services:
+  node:
+    image: ocs-node:latest
+    restart: always
+    depends_on:
+      - db
+  db:
+    image: postgres
+    restart: always
+    ports:
+     - "5432:5432"
+    volumes:
+      - "/var/lib/postgresql/data/pgdata"
+    environment:
+      POSTGRES_USER: acmusr
+      POSTGRES_PASSWORD: acmusr
+      POSTGRES_HOST: 'acm'
+      POSTGRES_DB: 'dev-test-pgsql-us.vzbi.com:5432' 
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+
