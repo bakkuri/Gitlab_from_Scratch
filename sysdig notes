@@ -1,0 +1,122 @@
+This page covers documentation and steps involved in various image scanning options provided by Sysdig Secure i.e. Inline/Adhoc Scanning and Jenkins CI/CD Scanning during buildtime.
+
+Adhoc/Inline Scanning
+Prerequisites 
+Adhoc Scan Instructions
+Jenkins CI/CD Scanning
+Integrate Sysdig Jenkins plugin inside a pipeline
+Integrate Sysdig Jenkins Plugin using a Freestyle Project
+Adhoc/Inline Scanning
+Sysdig Secure Inline Scanning is a command line utility and containerized application that can perform local analysis on container images and post the result of the analysis to Sysdig Secure.
+
+Prerequisites 
+Applicable for Prod console, POC users can use the user API token
+
+API Token - Submit request to obtain access token 
+Download Image to Local Instance using docker pull <Image Name>
+Sysdig Current Inline scan doc - https://docs.sysdig.com/en/integrate-with-ci-cd-tools.html
+           Sysdig New Scanning Engine doc - https://docs.sysdig.com/en/docs/sysdig-secure/vulnerabilities/pipeline/
+
+Adhoc Scan Instructions
+Download the inline scanner binary and use it to scan the target containers - 
+curl -LO "https://download.sysdig.com/scanning/bin/sysdig-cli-scanner/$(curl -L -s https://download.sysdig.com/scanning/sysdig-cli-scanner/latest_version.txt)/linux/amd64/sysdig-cli-scanner"
+chmod +x ./sysdig-cli-scanner
+Make sure the image is pulled locally 
+Analyze an Image by running the sysdig-cli-scanner command: 
+SECURE_API_TOKEN=<your-api-token> ./sysdig-cli-scanner --apiurl <sysdig-api-url> <image-name>
+
+Example: SECURE_API_TOKEN=<your-api-token> ./sysdig-cli-scanner —apiurl https://app.us3.sysdig.com go0v-vzdocker.oneartifactoryprod.verizon.com/openjdk-newrelic:5.9.0-11.0.6-jre-stretch-10
+
+
+Jenkins CI/CD Scanning
+The Sysdig Secure Jenkins plugin can be used in both freestyle and pipeline jobs to scan images and fail the build if the image fails a policy evaluation. Additional instructions can be found on Sysdig pages.
+
+Sydig Jenkins Plugin doc - https://plugins.jenkins.io/sysdig-secure/
+
+Integrate Sysdig Jenkins plugin inside a pipeline
+The following is a simplified example executing the Sysdig plugin as a stage inside a pipeline, it reads the Docker file and executes the various stages in pipeline from Jenkinsfile.
+
+stage('SysDig Scan'){ 
+
+        environment {
+        http_proxy = "http://proxy.ebiz.verizon.com:80/"
+        https_proxy = "http://proxy.ebiz.verizon.com:80/"
+        no_proxy = "169.254.169.254,127.0.0.1,localhost,.verizon.com,.vzwcorp.com,.vzbi.com,.eks.amazonaws.com"
+
+        DOCKER_HOST = "unix:///var/run/docker.sock"
+        }
+
+                  steps {
+
+                        script{                     
+
+                        env.http_proxy
+                        env.https_proxy
+                        env.no_proxy
+
+                        env.DOCKER_HOST
+
+                          echo "SysDig Scan"
+
+                          sh "echo ${image_id} > sysdig_secure_images"
+
+                          sysdig bailOnFail: false, bailOnPluginFail: false, engineCredentialsId: 'sysdig-secure-api-credential', engineurl: 'https://app.us3.sysdig.com', forceScan: false, name: 'sysdig_secure_images'
+
+
+
+                        }
+
+                  }
+
+               }
+
+Note: Infrastructure team or Application teams, if they are using Jenkins Pipeline , "Scanning Image" stage needs to be incorporated to their Pipeline Scripts.
+
+Note: The Sysdig Secure plugin reads a file called sysdig_secure_images (by default) for the list of images to scan so the image name which is being built need to be written to sysdig_secure_images.
+
+Navigate to your Pipeline job→ Configure → Advanced Project Options → Pipeline and Provide below details:
+                   Definition: From Dropdown, Select Pipeline Script from SCM
+
+                   SCM:Git
+
+                   Repository URL: Provide Gitlab Repo URL
+
+                   Credentials: Provide the Credentials to connect to Gitlab Repo
+
+                   Branches to Build: Provide the Branch Name
+
+                   Script Path: Jenkinsfile
+
+And Save Job configuration
+
+
+
+ 2.  Navigate to Pipeline project, click on “Build Now” once the build is completed, Stage view for various stages of the Pipeline job execution. Open the Build which is completed and click on Sysdig Secure Report as per the below screenshot. Click on Security, to list the vulnerabilities in the image.
+
+
+
+
+
+
+
+
+Integrate Sysdig Jenkins Plugin using a Freestyle Project
+Navigate to your Free style Project → Configure → Add Build step → Add Execute Shell
+Example commands to be executed:
+
+echo "FROM d0sv-docker-np.oneartifactoryprod.verizon.com/tomcat:10.0.2-1-ssh" > Dockerfile
+docker build --no-cache -t d0sv/tomcat:10.0.2-1-ssh-4 .
+echo "d0sv/tomcat:10.0.2-1-ssh-4" > sysdig_secure_images
+
+Note: The Sysdig Secure plugin reads a file called sysdig_secure_images (by default) for the list of images to scan.
+
+      
+
+       2.  Open the Add build step drop-down menu, and select Sysdig Secure Container Image Scanner. This creates a new build step labeled Sysdig Secure Plugin Build Options.
+
+      3.  Perform the build, Navigate to freestyle project, click on “Build Now” once the build is completed. Open the Build which is completed and click on Sysdig Secure Report as per the below screenshot. Click on Security, to list the vulnerabilities in the image.
+
+    
+
+
+
